@@ -63,10 +63,12 @@ class MultiTokenizerMixin:
         """init tokenizer mapping from register request"""
         ipc_name = recv_obj.ipc_name
         worker_id_int = int(worker_id)
-
+        if not self.tokenizer_mapping:
+            self.warmup_id = worker_id_int
         if worker_id_int not in self.tokenizer_mapping:
             socket = get_zmq_socket(self._zmq_context, zmq.PUSH, ipc_name, False)
             self.tokenizer_mapping[worker_id_int] = socket
+            recv_obj.warmup_id = self.warmup_id
             self.tokenizer_mapping[worker_id_int].send_pyobj(recv_obj)
             return True
         else:
@@ -472,7 +474,8 @@ class MultiTokenizerManager(TokenizerManager, MultiTokenizerMixin):
         req = MultiTokenizerRegisterReq(rids=[f"{self.worker_id}_register"])
         req.ipc_name = self.tokenizer_ipc_name
         _Communicator.enable_multi_tokenizer = True
-        await self.register_multi_tokenizer_communicator(req)
+        response = await self.register_multi_tokenizer_communicator(req)
+        return response[0].warmup_id
 
 
 async def print_exception_wrapper(func):

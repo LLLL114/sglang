@@ -1192,6 +1192,8 @@ LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = LoRAUpdateResult
 class MultiTokenizerRegisterReq:
     rids: Optional[Union[List[str], str]] = None
     ipc_name: Optional[str] = None
+    # choose a process to do warmup
+    warmup_id: Optional[int] = None
 
 
 @dataclass

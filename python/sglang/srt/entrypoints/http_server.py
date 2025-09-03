@@ -180,8 +180,12 @@ async def init_multi_tokenizer() -> ServerArgs:
         completion_template=server_args.completion_template,
     )
     # Register this tokenizer with the main tokenizer manager
-    await tokenizer_manager.register_to_main_tokenizer_manager()
-
+    warmup_id = await tokenizer_manager.register_to_main_tokenizer_manager()
+    if warmup_id == pid:
+        logger.info(f"Tokenizer Manager Worker {pid} is chosen to do warmup thread.")
+        do_warmup = True
+    else:
+        do_warmup = False
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
     set_global_state(
         _GlobalState(
@@ -190,7 +194,7 @@ async def init_multi_tokenizer() -> ServerArgs:
             scheduler_info=scheduler_info,
         )
     )
-    return server_args
+    return server_args, do_warmup
 
 
 @asynccontextmanager
@@ -198,18 +202,19 @@ async def lifespan(fast_api_app: FastAPI):
     server_args = getattr(fast_api_app, "server_args", None)
     if server_args is None:
         # Initialize multi-tokenizer support for worker processes
-        fast_api_app.server_args = await init_multi_tokenizer()
+        fast_api_app.server_args, do_warmup = await init_multi_tokenizer()
         setup_middlewares(
             fast_api_app.server_args.api_key, fast_api_app.server_args.enable_metrics
         )
-        fast_api_app.warmup_thread = threading.Thread(
-            target=_wait_and_warmup,
-            args=(
-                fast_api_app.server_args,
-                None,  # pipe_finish_writer not needed in worker
-                None,  # launch_callback not needed in worker
-            ),
-        )
+        if do_warmup: 
+            fast_api_app.warmup_thread = threading.Thread(
+                target=_wait_and_warmup,
+                args=(
+                    fast_api_app.server_args,
+                    None,  # pipe_finish_writer not needed in worker
+                    None,  # launch_callback not needed in worker
+                ),
+            )
 
     # Initialize OpenAI serving handlers
     fast_api_app.state.openai_serving_completion = OpenAIServingCompletion(
@@ -277,7 +282,8 @@ async def lifespan(fast_api_app: FastAPI):
         if server_args.tokenizer_worker_num > 1:
             pid = os.getpid()
             logger.info(f"uvicorn worker {pid} ending...")
-            warmup_thread.join()
+            if warmup_thread is not None:
+                warmup_thread.join()
             logger.info(f"uvicorn worker {pid} ended.")
 
 
