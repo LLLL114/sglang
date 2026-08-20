@@ -139,6 +139,38 @@ def _register_legacy_hicache_draft(
     tree_cache.cache_controller.set_draft_kv_pool(pool, draft_host_pool)
 
 
+def compute_auto_decode_retraction_backup(*, tp_worker: BaseTpWorker, mode: str) -> str:
+    """The retraction backend auto-selection for `mode`, ignoring any explicit
+    --disaggregation-decode-retraction-backup. Pure decision logic shared by
+    startup resolution and the runtime PD role switch (which must know the
+    backend the *other* role would pick before committing a cache rebuild).
+    """
+    disagg = get_disagg()
+    kv_cache = tp_worker.get_memory_pool()[1].get_kvcache()
+    full_tokens_per_layer = (
+        tp_worker.get_tokens_per_layer_info()[0] if tp_worker.is_hybrid_swa else None
+    )
+    supports_host_pool = isinstance(kv_cache, MHATokenToKVPool) or (
+        isinstance(kv_cache, SWAKVPool) and full_tokens_per_layer > 0
+    )
+    schedule = get_schedule()
+    priority_preemption = (
+        schedule.enable_priority_scheduling
+        and not schedule.disable_priority_preemption
+    )
+    return (
+        "host_pool"
+        if mode == "decode"
+        and not get_parallel().dcp_enabled
+        and not disagg.disaggregation_decode_enable_radix_cache
+        # KV offload already owns a host pool; a second one double-books host memory.
+        and not disagg.disaggregation_decode_enable_offload_kvcache
+        and not priority_preemption
+        and supports_host_pool
+        else "cpu_tensor"
+    )
+
+
 def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
     """Resolve the retraction backend onto the config bags and return it.
 
@@ -152,30 +184,8 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
 
     backend = disagg.disaggregation_decode_retraction_backup
     if backend is None:
-        kv_cache = tp_worker.get_memory_pool()[1].get_kvcache()
-        full_tokens_per_layer = (
-            tp_worker.get_tokens_per_layer_info()[0]
-            if tp_worker.is_hybrid_swa
-            else None
-        )
-        supports_host_pool = isinstance(kv_cache, MHATokenToKVPool) or (
-            isinstance(kv_cache, SWAKVPool) and full_tokens_per_layer > 0
-        )
-        schedule = get_schedule()
-        priority_preemption = (
-            schedule.enable_priority_scheduling
-            and not schedule.disable_priority_preemption
-        )
-        backend = (
-            "host_pool"
-            if disagg.disaggregation_mode == "decode"
-            and not get_parallel().dcp_enabled
-            and not disagg.disaggregation_decode_enable_radix_cache
-            # KV offload already owns a host pool; a second one double-books host memory.
-            and not disagg.disaggregation_decode_enable_offload_kvcache
-            and not priority_preemption
-            and supports_host_pool
-            else "cpu_tensor"
+        backend = compute_auto_decode_retraction_backup(
+            tp_worker=tp_worker, mode=disagg.disaggregation_mode
         )
         fields["disaggregation_decode_retraction_backup"] = backend
 
@@ -207,6 +217,7 @@ def build_kv_cache(
     pp_group: GroupCoordinator,
     enable_hierarchical_cache: bool,
     hicache_draft_plan: Optional[HiCacheDraftPlan] = None,
+    for_pd_role_switch: bool = False,
 ) -> KVCacheBuildResult:
     sliding_window_size: Optional[int] = None
     full_tokens_per_layer: Optional[int] = None
@@ -341,7 +352,10 @@ def build_kv_cache(
         tree_cache.validate_retraction_host_capacity()
 
     embedding_cache_size = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
-    init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
+    if not for_pd_role_switch:
+        # A role switch only rebuilds the tree cache; the process-wide
+        # multimodal embedding cache is already installed.
+        init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
 
     return KVCacheBuildResult(
         is_hybrid_swa=is_hybrid_swa,

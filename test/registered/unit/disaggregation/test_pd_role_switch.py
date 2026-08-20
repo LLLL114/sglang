@@ -58,6 +58,9 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         teardown_patcher = patch.object(role_switch, "teardown_disaggregation")
         s.teardown_disaggregation = teardown_patcher.start()
         self.addCleanup(teardown_patcher.stop)
+        switch_patcher = patch.object(role_switch, "switch_tree_cache")
+        s.switch_tree_cache = switch_patcher.start()
+        self.addCleanup(switch_patcher.stop)
         s.init_disaggregation = MagicMock()
         s._sync_disaggregation_mode_to_subcomponents = MagicMock()
         s._event_loop_should_restart = False
@@ -121,11 +124,14 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         self.assertTrue(out.success)
         self.assertEqual(out.old_role, "prefill")
         self.assertEqual(out.new_role, "decode")
-        # Orchestration: drain -> teardown -> flip config bag -> rebuild -> signal.
+        # Orchestration: drain -> teardown -> flip config bag -> tree cache
+        # reset/rebuild -> rebuild queues -> signal.
         s.teardown_disaggregation.assert_called_once_with(s)
         self.assertEqual(rc.get_disagg().disaggregation_mode, "decode")
         # The pristine startup record is never mutated.
         self.assertEqual(s.server_args.disaggregation_mode, "prefill")
+        # The tree cache switch runs after the mode flip, before the queues.
+        s.switch_tree_cache.assert_called_once_with(s, "prefill", "decode")
         s.init_disaggregation.assert_called_once()
         s._sync_disaggregation_mode_to_subcomponents.assert_called_once()
         self.assertTrue(s._event_loop_should_restart)
@@ -263,6 +269,10 @@ class TestPdRoleSwitchStartupValidation(unittest.TestCase):
             dp_size=1,
             dcp_size=1,
             speculative_algorithm=None,
+            disable_radix_cache=False,
+            disaggregation_decode_enable_radix_cache=False,
+            disaggregation_decode_extra_slots=None,
+            max_running_requests=None,
         )
         base.update(kw)
         return SimpleNamespace(**base)
@@ -311,6 +321,41 @@ class TestPdRoleSwitchStartupValidation(unittest.TestCase):
     def test_no_role_switch_is_unaffected(self):
         # The same unsupported feature is fine when role switch is off.
         self._run(self._sa(enable_pd_role_switch=False, moe_a2a_backend="mori"))
+
+    def test_per_role_radix_intent_recorded_on_prefill_start(self):
+        sa = self._sa()
+        self._run(sa)
+        self.assertEqual(
+            sa._pd_role_disable_radix_cache, {"prefill": False, "decode": True}
+        )
+        # The started role's flag is untouched for a prefill node.
+        self.assertFalse(sa.disable_radix_cache)
+
+    def test_per_role_radix_intent_survives_decode_forcing(self):
+        # A decode-started node has disable_radix_cache force-overwritten; the
+        # stash must still carry the pre-forcing prefill intent.
+        sa = self._sa(disaggregation_mode="decode")
+        self._run(sa)
+        self.assertTrue(sa.disable_radix_cache)  # forced for decode
+        self.assertEqual(
+            sa._pd_role_disable_radix_cache, {"prefill": False, "decode": True}
+        )
+
+    def test_per_role_radix_intent_honors_decode_radix_flag(self):
+        sa = self._sa(
+            disaggregation_mode="decode",
+            disaggregation_decode_enable_radix_cache=True,
+            enable_hisparse=False,
+        )
+        self._run(sa)
+        self.assertEqual(
+            sa._pd_role_disable_radix_cache, {"prefill": False, "decode": False}
+        )
+
+    def test_no_intent_recorded_without_role_switch(self):
+        sa = self._sa(enable_pd_role_switch=False)
+        self._run(sa)
+        self.assertFalse(hasattr(sa, "_pd_role_disable_radix_cache"))
 
 
 # --- teardown: transfer-worker thread-leak fix + prefix-cache release (radix ON) ---
@@ -566,13 +611,227 @@ class TestReleasePrefixCacheOnRoleSwitch(unittest.TestCase):
         s.req_to_token_pool.clear.assert_called_once_with()
         s.token_to_kv_pool_allocator.clear.assert_called_once_with()
 
-    def test_teardown_invokes_release(self):
+    def test_teardown_leaves_prefix_cache_to_switch(self):
+        # The cache release moved out of teardown into switch_tree_cache,
+        # which runs after the config-bag mode flip (recipe re-resolution
+        # must see the new role).
         s = _radix_scheduler(disable_radix_cache=False)
         s.disaggregation_mode = DisaggregationMode.PREFILL
         s.disagg_prefill_bootstrap_queue = None  # no queue -> skip km.teardown()
         teardown_disaggregation(s)
         self.assertIsNone(s.disagg_metadata_buffers)
-        s.tree_cache.reset.assert_called_once_with()
+        s.tree_cache.reset.assert_not_called()
+
+
+@unittest.skipUnless(_HAS_ROLE_SWITCH, "role_switch not importable in this env")
+class TestSwitchTreeCacheDispatch(unittest.TestCase):
+    """switch_tree_cache: equal recipes take the historical reset path;
+    differing recipes destroy the old cache and rebuild one for the new role."""
+
+    def _dispatch(self, recipes):
+        s = _radix_scheduler(disable_radix_cache=False)
+        with patch.object(
+            role_switch, "_tree_cache_recipe_for_role", side_effect=recipes
+        ), patch.object(
+            role_switch, "_release_prefix_cache_for_role_switch"
+        ) as release, patch.object(
+            role_switch, "_destroy_tree_cache_for_role_switch"
+        ) as destroy, patch.object(
+            role_switch, "_rebuild_tree_cache_for_role_switch"
+        ) as rebuild:
+            role_switch.switch_tree_cache(s, "prefill", "decode")
+        return s, release, destroy, rebuild
+
+    def test_same_recipe_takes_reset_path(self):
+        s, release, destroy, rebuild = self._dispatch(
+            [(False, "cpu_tensor"), (False, "cpu_tensor")]
+        )
+        release.assert_called_once_with(s)
+        destroy.assert_not_called()
+        rebuild.assert_not_called()
+
+    def test_recipe_change_destroys_and_rebuilds(self):
+        s, release, destroy, rebuild = self._dispatch(
+            [(False, "cpu_tensor"), (True, "host_pool")]
+        )
+        release.assert_not_called()
+        destroy.assert_called_once_with(s)
+        rebuild.assert_called_once_with(s, "decode")
+
+
+@unittest.skipUnless(_HAS_ROLE_SWITCH, "role_switch not importable in this env")
+class TestRoleTreeCacheRecipe(unittest.TestCase):
+    """The recipe (disable_radix_cache, retraction_backup) drives the rebuild
+    decision; both legs must be computed per role, not read from the started
+    role's resolved flags."""
+
+    def _s(self, stash, *, started="prefill", resolved_disable=False):
+        s = MagicMock()
+        s.server_args = SimpleNamespace(
+            disaggregation_mode=started,
+            disable_radix_cache=resolved_disable,
+            disaggregation_decode_retraction_backup=None,
+        )
+        if stash is not None:
+            s.server_args._pd_role_disable_radix_cache = stash
+        return s
+
+    def test_stash_maps_roles(self):
+        s = self._s({"prefill": False, "decode": True})
+        self.assertFalse(role_switch._role_disable_radix_cache(s, "prefill"))
+        self.assertTrue(role_switch._role_disable_radix_cache(s, "decode"))
+
+    def test_later_model_forcing_applies_to_both_roles(self):
+        # Started as prefill with radix-ON intent, but a model-specific pass
+        # after the PD hook forced radix off: that forcing is role-independent
+        # and must survive every flip.
+        s = self._s({"prefill": False, "decode": True}, resolved_disable=True)
+        self.assertTrue(role_switch._role_disable_radix_cache(s, "prefill"))
+        self.assertTrue(role_switch._role_disable_radix_cache(s, "decode"))
+
+    def test_explicit_retraction_backup_is_role_independent(self):
+        s = self._s({"prefill": False, "decode": True})
+        s.server_args.disaggregation_decode_retraction_backup = "cpu_tensor"
+        self.assertEqual(
+            role_switch._role_retraction_backup(s, "decode"), "cpu_tensor"
+        )
+
+    def test_auto_retraction_backup_resolves_per_role(self):
+        s = self._s({"prefill": False, "decode": True})
+        with patch(
+            "sglang.srt.mem_cache.kv_cache_builder.compute_auto_decode_retraction_backup",
+            side_effect=lambda *, tp_worker, mode: (
+                "host_pool" if mode == "decode" else "cpu_tensor"
+            ),
+        ):
+            self.assertEqual(
+                role_switch._tree_cache_recipe_for_role(s, "prefill"),
+                (False, "cpu_tensor"),
+            )
+            self.assertEqual(
+                role_switch._tree_cache_recipe_for_role(s, "decode"),
+                (True, "host_pool"),
+            )
+
+
+@unittest.skipUnless(_HAS_ROLE_SWITCH, "role_switch not importable in this env")
+class TestDestroyTreeCacheOnRoleSwitch(unittest.TestCase):
+    """A recipe-changing flip must fully release the old cache: L3 cleared and
+    detached (storage daemon threads stopped), pinned host pools destroyed,
+    shared device-pool hooks unhooked, and the atexit auto-detach unregistered
+    so the dead cache is collectable."""
+
+    def _scheduler(self):
+        s = MagicMock()
+        tree = MagicMock()
+        s.tree_cache = tree
+        s.req_to_token_pool = MagicMock()
+        s.token_to_kv_pool_allocator = MagicMock()
+        s.tp_worker = MagicMock()
+        return s, tree
+
+    def test_full_release_of_hicache_variant(self):
+        s, tree = self._scheduler()
+        with patch("atexit.unregister") as unreg:
+            role_switch._destroy_tree_cache_for_role_switch(s)
+        tree.clear_storage_backend.assert_called_once_with()
+        tree.detach_storage_backend.assert_called_once_with()
+        tree.reset.assert_called_once_with()
+        tree.release_host_resources.assert_called_once_with()
+        kv = s.token_to_kv_pool_allocator.get_kvcache.return_value
+        kv.register_layer_transfer_counter.assert_called_once_with(None)
+        s.tp_worker.register_hicache_layer_transfer_counter.assert_called_once_with(
+            None
+        )
+        unreg.assert_called_once_with(tree.shutdown)
+        s.req_to_token_pool.clear.assert_called_once_with()
+        s.token_to_kv_pool_allocator.clear.assert_called_once_with()
+
+    def test_plain_radix_cache_release(self):
+        s, tree = self._scheduler()
+        del tree.clear_storage_backend  # plain RadixCache has none of these
+        del tree.detach_storage_backend
+        del tree.shutdown
+        role_switch._destroy_tree_cache_for_role_switch(s)
+        tree.reset.assert_called_once_with()
+        tree.release_host_resources.assert_called_once_with()
+        s.token_to_kv_pool_allocator.clear.assert_called_once_with()
+
+    def test_storage_failure_does_not_abort_destruction(self):
+        s, tree = self._scheduler()
+        tree.clear_storage_backend.side_effect = RuntimeError("backend gone")
+        tree.detach_storage_backend.side_effect = RuntimeError("backend gone")
+        role_switch._destroy_tree_cache_for_role_switch(s)
+        tree.reset.assert_called_once_with()
+        tree.release_host_resources.assert_called_once_with()
+
+
+@unittest.skipUnless(_HAS_ROLE_SWITCH, "role_switch not importable in this env")
+class TestRebuildTreeCacheOnRoleSwitch(unittest.TestCase):
+    """The rebuild must land the new role's cache config on the bags, rebuild
+    through the regular kv_cache_builder path, and rebind every holder."""
+
+    def setUp(self):
+        rc.reset_context()
+
+    def tearDown(self):
+        rc.reset_context()
+
+    def _scheduler(self, sa):
+        rc.get_context().set_server_args(sa)
+        s = MagicMock()
+        s.server_args = sa
+        s._kv_cache_build_kwargs = {}
+        return s
+
+    def test_rebuild_to_decode_re_resolves_config(self):
+        sa = ServerArgs(model_path="dummy", disaggregation_mode="prefill")
+        sa._pd_role_disable_radix_cache = {"prefill": False, "decode": True}
+        s = self._scheduler(sa)
+        new_cache = MagicMock()
+        result = SimpleNamespace(disable_radix_cache=True, tree_cache=new_cache)
+        with patch(
+            "sglang.srt.mem_cache.kv_cache_builder.build_kv_cache",
+            return_value=result,
+        ) as build:
+            role_switch._rebuild_tree_cache_for_role_switch(s, "decode")
+        # Role-derived config landed on the bags: radix off, retraction backend
+        # and hicache ratio cleared for re-resolution against the decode role.
+        self.assertTrue(rc.get_memory().disable_radix_cache)
+        self.assertIsNone(rc.get_disagg().disaggregation_decode_retraction_backup)
+        self.assertIsNone(rc.get_memory().hicache_ratio)
+        build.assert_called_once_with(for_pd_role_switch=True)
+        self.assertIs(s.disable_radix_cache, True)
+        s._rebind_tree_cache.assert_called_once_with(new_cache)
+
+    def test_rebuild_to_prefill_restores_static_hicache_ratio(self):
+        # A decode-started node kept the ratio unset for the retraction
+        # resolver; flipping to prefill must restore the static default.
+        sa = ServerArgs(model_path="dummy", disaggregation_mode="decode")
+        sa._pd_role_disable_radix_cache = {"prefill": False, "decode": True}
+        s = self._scheduler(sa)
+        result = SimpleNamespace(disable_radix_cache=False, tree_cache=MagicMock())
+        with patch(
+            "sglang.srt.mem_cache.kv_cache_builder.build_kv_cache",
+            return_value=result,
+        ):
+            role_switch._rebuild_tree_cache_for_role_switch(s, "prefill")
+        self.assertFalse(rc.get_memory().disable_radix_cache)
+        self.assertEqual(rc.get_memory().hicache_ratio, 2.0)
+
+    def test_explicit_hicache_ratio_is_kept(self):
+        sa = ServerArgs(
+            model_path="dummy", disaggregation_mode="prefill", hicache_ratio=3.0
+        )
+        sa._pd_role_disable_radix_cache = {"prefill": False, "decode": True}
+        s = self._scheduler(sa)
+        result = SimpleNamespace(disable_radix_cache=True, tree_cache=MagicMock())
+        with patch(
+            "sglang.srt.mem_cache.kv_cache_builder.build_kv_cache",
+            return_value=result,
+        ):
+            role_switch._rebuild_tree_cache_for_role_switch(s, "decode")
+        self.assertEqual(rc.get_memory().hicache_ratio, 3.0)
 
 
 if __name__ == "__main__":

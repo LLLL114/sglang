@@ -522,8 +522,10 @@ class Scheduler(
         if (t := envs.SGLANG_TEST_STUCK_SCHEDULER_INIT.get()) > 0:
             time.sleep(t)
 
-        # Init cache and memory pool
-        result = kv_cache_builder.build_kv_cache(
+        # Init cache and memory pool. The kwargs are kept so a runtime PD role
+        # switch can rebuild the tree cache with the same inputs (all of them
+        # are long-lived scheduler members; only the config bags change).
+        self._kv_cache_build_kwargs = dict(
             server_args=self.server_args,
             model_config=self.model_config,
             tp_worker=self.tp_worker,
@@ -549,6 +551,7 @@ class Scheduler(
                 else None
             ),
         )
+        result = kv_cache_builder.build_kv_cache(**self._kv_cache_build_kwargs)
         self.is_hybrid_swa = result.is_hybrid_swa
         self.is_hybrid_ssm = result.is_hybrid_ssm
         self.sliding_window_size = result.sliding_window_size
@@ -4957,6 +4960,40 @@ class Scheduler(
                 object.__setattr__(
                     comp, "disaggregation_mode", self.disaggregation_mode
                 )
+
+    def _rebind_tree_cache(self, new_tree_cache) -> None:
+        """Point every long-lived tree_cache holder at a rebuilt cache.
+
+        Used by the runtime PD role switch after it destroys and rebuilds the
+        prefix cache. The disaggregation queues are not listed: they are
+        recreated by init_disaggregation, which runs after the rebuild.
+        object.__setattr__ because some holders are frozen dataclasses.
+        """
+        self.tree_cache = new_tree_cache
+        for name in (
+            "session_controller",
+            "pool_stats_observer",
+            "invariant_checker",
+            "kv_events_publisher",
+            "output_streamer",
+            "batch_result_processor",
+            "dp_attn_adapter",
+            "decode_offload_manager",
+        ):
+            comp = getattr(self, name, None)
+            if comp is not None and hasattr(comp, "tree_cache"):
+                object.__setattr__(comp, "tree_cache", new_tree_cache)
+        # SchedulePolicy derives its cache-aware/agnostic mode from the tree
+        # cache at construction, so rebuild it instead of rebinding the field.
+        self.policy = SchedulePolicy(
+            self.schedule_policy,
+            new_tree_cache,
+            self.enable_hierarchical_cache,
+            self.enable_priority_scheduling,
+            self.schedule_low_priority_values_first,
+        )
+        if (c := self.tp_worker.model_runner.canary_manager) is not None:
+            c.attach_radix_cache(new_tree_cache)
 
     def expert_distribution_handle(self, recv_req: ExpertDistributionReq):
         action = recv_req.action

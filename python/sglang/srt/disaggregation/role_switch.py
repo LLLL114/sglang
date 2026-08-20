@@ -2,17 +2,21 @@
 
 The token KV pool is role-independent and never reallocated; only the
 role-specific disaggregation structures are torn down and rebuilt on a flip.
+The prefix (tree) cache is role-dependent: when both roles select the same
+cache recipe it is merely reset, otherwise it is destroyed (host pools,
+storage daemon threads included) and rebuilt for the new role.
 Kept out of scheduler.py to avoid growing it further.
 """
 
 from __future__ import annotations
 
+import atexit
 import logging
 from typing import TYPE_CHECKING, Callable, Optional
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import PdRoleSwitchReqInput, PdRoleSwitchReqOutput
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, get_memory
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
@@ -76,6 +80,7 @@ def handle_pd_role_switch(
         try:
             teardown_disaggregation(scheduler)
             get_context().override("role_switch.flip", disaggregation_mode=new_role)
+            switch_tree_cache(scheduler, old_role, new_role)
             scheduler.init_disaggregation()
             scheduler._sync_disaggregation_mode_to_subcomponents()
         except Exception as e:
@@ -185,7 +190,156 @@ def teardown_disaggregation(scheduler: Scheduler) -> None:
         scheduler.disagg_decode_transfer_queue = None
     scheduler.disagg_metadata_buffers = None
     scheduler.req_to_metadata_buffer_idx_allocator = None
-    _release_prefix_cache_for_role_switch(scheduler)
+
+
+def switch_tree_cache(scheduler: Scheduler, old_role: str, new_role: str) -> None:
+    """Reset or rebuild the prefix cache for the flipped role.
+
+    The cache *type* is a function of role-derived configuration (see
+    _tree_cache_recipe_for_role). When both roles resolve to the same recipe
+    the historical reset path is enough; when they differ, the old cache is
+    fully destroyed (pinned host pools, storage daemon threads, shared-pool
+    hooks) and a new one is built through the regular kv_cache_builder path.
+    Must run after the disaggregation-mode flip so re-resolution against the
+    config bags sees the new role.
+    """
+    old_recipe = _tree_cache_recipe_for_role(scheduler, old_role)
+    new_recipe = _tree_cache_recipe_for_role(scheduler, new_role)
+    if new_recipe == old_recipe:
+        _release_prefix_cache_for_role_switch(scheduler)
+        return
+    logger.info(
+        "PD role switch %s -> %s changes the tree cache recipe "
+        "(disable_radix_cache, retraction_backup): %s -> %s; rebuilding %s",
+        old_role,
+        new_role,
+        old_recipe,
+        new_recipe,
+        type(scheduler.tree_cache).__name__,
+    )
+    _destroy_tree_cache_for_role_switch(scheduler)
+    _rebuild_tree_cache_for_role_switch(scheduler, new_role)
+
+
+def _role_disable_radix_cache(scheduler: Scheduler, role: str) -> bool:
+    """The disable_radix_cache value `role` selects its tree cache with."""
+    sa = scheduler.server_args
+    stash = getattr(sa, "_pd_role_disable_radix_cache", None)
+    if stash is None:
+        # No per-role intent recorded (e.g. schedulers built directly in
+        # tests): keep the currently resolved flag for both roles.
+        return get_memory().disable_radix_cache
+    # A model-specific resolution pass after the PD hook may force radix off
+    # for reasons that apply to both roles. Detect it on the pristine startup
+    # record: the started role's recorded intent was radix ON, yet the
+    # resolved flag ended up OFF.
+    later_forced = sa.disable_radix_cache and not stash[sa.disaggregation_mode]
+    return stash[role] or later_forced
+
+
+def _role_retraction_backup(scheduler: Scheduler, role: str) -> str:
+    """The retraction-backup backend `role` selects its tree cache with."""
+    explicit = scheduler.server_args.disaggregation_decode_retraction_backup
+    if explicit is not None:
+        return explicit
+    from sglang.srt.mem_cache.kv_cache_builder import (
+        compute_auto_decode_retraction_backup,
+    )
+
+    return compute_auto_decode_retraction_backup(
+        tp_worker=scheduler.tp_worker, mode=role
+    )
+
+
+def _tree_cache_recipe_for_role(scheduler: Scheduler, role: str) -> tuple[bool, str]:
+    """The role-derived inputs that drive tree cache selection.
+
+    Everything else feeding default_radix_cache_factory (model hybridness,
+    env flags, hierarchical-cache enablement, ...) is role-independent, so
+    two roles with equal recipes build the same cache type.
+    """
+    return (
+        _role_disable_radix_cache(scheduler, role),
+        _role_retraction_backup(scheduler, role),
+    )
+
+
+def _destroy_tree_cache_for_role_switch(scheduler: Scheduler) -> None:
+    """Fully release the old role's prefix cache before rebuilding.
+
+    reset() alone is not enough across cache types: the HiCache variants own
+    pinned host pools, storage prefetch/backup daemon threads, a
+    layer-transfer hook on the shared device pool, and an atexit auto-detach
+    holding a strong reference — all of which would leak once the scheduler
+    drops its reference. The instance is fully idle (checked before
+    teardown), so nothing races the destruction.
+    """
+    tree_cache = scheduler.tree_cache
+    # Best-effort L3 clear while the bookkeeping is still intact: stale pages
+    # must not be matched by the rebuilt cache of the other role.
+    clear_storage = getattr(tree_cache, "clear_storage_backend", None)
+    if callable(clear_storage):
+        try:
+            clear_storage()
+        except Exception:
+            logger.exception("hicache storage clear on role switch failed")
+    # Stop the prefetch/backup daemon threads and release the L3 backend.
+    detach_storage = getattr(tree_cache, "detach_storage_backend", None)
+    if callable(detach_storage):
+        try:
+            detach_storage()
+        except Exception:
+            logger.exception("hicache storage detach on role switch failed")
+    # Unlock and drop every cached prefix (frees the shared device KV slots).
+    tree_cache.reset()
+    # Free the pinned host pools (HiCache L2); idempotent no-op otherwise.
+    tree_cache.release_host_resources()
+    # Unhook the dead cache's controller from the shared device pool and the
+    # tp_worker; a stale LayerDoneCounter would gate KV reads forever.
+    kv_cache = scheduler.token_to_kv_pool_allocator.get_kvcache()
+    if hasattr(kv_cache, "register_layer_transfer_counter"):
+        kv_cache.register_layer_transfer_counter(None)
+    scheduler.tp_worker.register_hicache_layer_transfer_counter(None)
+    # The HiCache variants atexit-register their shutdown; unregister so the
+    # dead cache is collectable and no stale detach runs at process exit.
+    shutdown = getattr(tree_cache, "shutdown", None)
+    if callable(shutdown):
+        atexit.unregister(shutdown)
+    scheduler.req_to_token_pool.clear()
+    scheduler.token_to_kv_pool_allocator.clear()
+
+
+def _rebuild_tree_cache_for_role_switch(scheduler: Scheduler, new_role: str) -> None:
+    """Re-resolve the role-derived cache config and rebuild the tree cache."""
+    from sglang.srt.mem_cache import kv_cache_builder
+
+    sa = scheduler.server_args
+    fields = {"disable_radix_cache": _role_disable_radix_cache(scheduler, new_role)}
+    if sa.disaggregation_decode_retraction_backup is None:
+        # Startup auto-resolved the backend for the old role; clear it so
+        # build_kv_cache re-resolves against the flipped mode.
+        fields["disaggregation_decode_retraction_backup"] = None
+    if not getattr(sa, "_hicache_ratio_user_set", True):
+        # Re-default per role, mirroring startup: decode leaves the ratio to
+        # the retraction resolver (1.0 for host_pool), prefill takes the
+        # static default from _handle_hicache_ratio_default.
+        fields["hicache_ratio"] = (
+            None
+            if new_role == "decode"
+            else (1.2 if sa.hicache_host_memory_mode == "buffer_only" else 2.0)
+        )
+    get_context().override("role_switch.tree_cache", **fields)
+
+    result = kv_cache_builder.build_kv_cache(
+        **scheduler._kv_cache_build_kwargs, for_pd_role_switch=True
+    )
+    scheduler.disable_radix_cache = result.disable_radix_cache
+    scheduler._rebind_tree_cache(result.tree_cache)
+    logger.info(
+        "PD role switch rebuilt tree cache for %s role: %s",
+        new_role,
+        type(result.tree_cache).__name__,
+    )
 
 
 def _release_prefix_cache_for_role_switch(scheduler: Scheduler) -> None:

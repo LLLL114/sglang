@@ -7444,6 +7444,9 @@ class ServerArgs:
         A decode server keeps the ratio unset here: kv_cache_builder resolves
         it against the retraction-backup backend (1.0 for host_pool, else 2.0).
         """
+        # A runtime PD role switch re-resolves the ratio per role, but only
+        # when it was defaulted here (an explicit --hicache-ratio is kept).
+        self._hicache_ratio_user_set = self.hicache_ratio is not None
         if self.hicache_ratio is None and self.disaggregation_mode != "decode":
             self.hicache_ratio = (
                 1.2 if self.hicache_host_memory_mode == "buffer_only" else 2.0

@@ -15,6 +15,11 @@ logger = logging.getLogger(__name__)
 
 def handle_pd_disaggregation(server_args: ServerArgs) -> None:
     """Validate and normalize PD-disaggregation server args."""
+    # The decode branch below force-overwrites disable_radix_cache; keep the
+    # pre-forcing (user CLI) value so a runtime role switch can recompute the
+    # per-role radix-cache intent (see role_switch tree-cache rebuild).
+    disable_radix_cache_before_role_forcing = server_args.disable_radix_cache
+
     # "mooncake_tcp" is mooncake with the TCP transport forced: set MC_FORCE_TCP
     # so mooncake installs TcpTransport instead of RDMA, rewrite the backend to
     # mooncake, and skip RDMA HCA selection. Must run before backend-name checks.
@@ -152,6 +157,15 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                     + ", ".join(unsupported)
                     + ". Remove these options or drop --enable-pd-role-switch."
                 )
+
+            # Per-role radix-cache intent, consumed by the role-switch tree
+            # cache rebuild: the decode branch above already overwrote
+            # disable_radix_cache for a decode-started node, so the prefill
+            # value must come from the pre-forcing snapshot.
+            server_args._pd_role_disable_radix_cache = {
+                "prefill": disable_radix_cache_before_role_forcing,
+                "decode": not server_args.disaggregation_decode_enable_radix_cache,
+            }
 
 
 def _alias_bootstrap_port_to_api_port(server_args: ServerArgs) -> None:
