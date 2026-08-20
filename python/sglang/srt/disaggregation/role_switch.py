@@ -321,8 +321,8 @@ def _rebuild_tree_cache_for_role_switch(scheduler: Scheduler, new_role: str) -> 
         fields["disaggregation_decode_retraction_backup"] = None
     if not getattr(sa, "_hicache_ratio_user_set", True):
         # Re-default per role, mirroring startup: decode leaves the ratio to
-        # the retraction resolver (1.0 for host_pool), prefill takes the
-        # static default from _handle_hicache_ratio_default.
+        # the retraction resolver (backup-only sizing for host_pool), prefill
+        # takes the static default from _handle_hicache_ratio_default.
         fields["hicache_ratio"] = (
             None
             if new_role == "decode"
