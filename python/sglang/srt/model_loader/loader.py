@@ -990,12 +990,20 @@ class DefaultModelLoader(BaseModelLoader):
                 FLASHINFER_NVFP4_4OVER6_ERR_MODE="MSE",
                 FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH="1",
             ):
-                model.load_weights(weights)
+                from sglang.srt.weight_cache.weight_load_recorder import (
+                    maybe_record_model_weight_load,
+                )
+
+                maybe_record_model_weight_load(model, weights)
             if target_device.type == "cuda":
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
         else:
-            model.load_weights(weights)
+            from sglang.srt.weight_cache.weight_load_recorder import (
+                maybe_record_model_weight_load,
+            )
+
+            maybe_record_model_weight_load(model, weights)
 
         # Used in tests to verify memory savings when using online quantization.
         if is_cuda_alike():
