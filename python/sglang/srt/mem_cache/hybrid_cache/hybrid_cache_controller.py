@@ -576,6 +576,11 @@ class HybridCacheController(BaseHiCacheController):
         return operation.id
 
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
+        if getattr(self.storage_backend, "supports_prefetch_context", False):
+            hashes, tokens = super()._storage_hit_query(operation)
+            operation.pool_storage_result.update_kv_hit_pages(tokens // self.page_size)
+            return hashes, tokens
+
         hash_value = self.get_hash_str(
             operation.token_ids, operation.last_hash, page_size=self.page_size
         )
