@@ -711,6 +711,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def prepare_prefetch(self, keys, *, operation_id):
         return self.kv_reshard.discover(self._tag_keys(keys), operation_id)
 
+    def pack_prefetch_context(self, context):
+        return self.kv_reshard.pack_prefetch_context(context)
+
+    def unpack_prefetch_context(self, payload, keys):
+        return self.kv_reshard.unpack_prefetch_context(payload, self._tag_keys(keys))
+
     def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
         if self.supports_prefetch_context and host_pool_name != PoolName.KV:
             raise ValueError("KV Store reshard does not support side pools")

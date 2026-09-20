@@ -508,3 +508,30 @@ def test_grouped_upload_preserves_kv_type_without_mutating_cached_config(monkeyp
     assert upload(a, ["a"], torch.tensor([0, 1]), grouped=True) == [True]
     assert seen == [(a.payload_config.data_type, ["sglang-hicache:a"] * 2)]
     assert a.payload_config.group_ids == initial_group_ids
+
+
+def test_compact_context_roundtrip_checks_local_keys_and_domain():
+    import pickle
+
+    native = MemoryStore()
+    keys = ["a", "b"]
+    for rank in range(3):
+        writer = adapter(native, "page_head", 1, 3, rank)
+        fill_or_check(writer, [0, 1, 2, 3])
+        assert upload(writer, keys, torch.arange(4)) == [True, True]
+    reader = adapter(native, "page_first", 2, 2)
+    context = reader.discover(keys, "compact")
+    packed = reader.pack_prefetch_context(context)
+    assert reader.unpack_prefetch_context(packed, keys) == context
+    assert len(packed) < len(pickle.dumps(context, protocol=pickle.HIGHEST_PROTOCOL))
+    with pytest.raises(ValueError, match="local page keys"):
+        reader.unpack_prefetch_context(packed, ["a", "different"])
+    with pytest.raises(ValueError, match="exceeds local"):
+        reader.unpack_prefetch_context(packed, ["a"])
+    wrong_model = adapter(native, "page_first", 2, 2, revision="weights-2")
+    with pytest.raises(ValueError, match="model domain"):
+        wrong_model.unpack_prefetch_context(packed, keys)
+    fields = list(pickle.loads(packed))
+    fields[0] = 999
+    with pytest.raises(ValueError, match="version"):
+        reader.unpack_prefetch_context(pickle.dumps(tuple(fields)), keys)

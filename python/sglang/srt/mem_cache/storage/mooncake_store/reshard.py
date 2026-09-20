@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import pickle
 import uuid
 from dataclasses import replace
 
@@ -27,6 +28,7 @@ from mooncake.reshard.kv_cache import (
     KVCacheStore,
     KVCacheStoreFormat,
     KVCacheStoreManifest,
+    KVCacheStoreReadContext,
     KVCacheTopology,
     KVCacheTopologyParticipant,
     plan_kv_cache_store_upload,
@@ -228,6 +230,17 @@ class MooncakeKVReshardAdapter:
         self._model_domain = manifest.model_domain
         self.payload_config = self.store.backend.payload_config()
         self._pool_signature = self._current_pool_signature()
+        axis = 1 if pool.layout == "layer_first" else 0
+        self._translation_unit = (
+            pool.page_size if pool.layout in ("page_first_direct", "page_head") else 1
+        )
+        self._translation_steps = tuple(
+            (component.value, tensor.stride(axis) * tensor.element_size())
+            for component, tensor in (
+                (KVCacheComponent.KEY, pool.k_buffer),
+                (KVCacheComponent.VALUE, pool.v_buffer),
+            )
+        )
         self._upload_suffixes = tuple(
             key[len("page") :]
             for key, writer in zip(
@@ -424,6 +437,36 @@ class MooncakeKVReshardAdapter:
         )
         return context
 
+    def pack_prefetch_context(self, context):
+        # Every rank already hashes the same request. Keep a digest to detect
+        # divergent request/order, rather than broadcasting all tagged keys.
+        return pickle.dumps(
+            (
+                1,
+                context.operation_id,
+                context.catalog,
+                context.layout_ids,
+                context.manifests,
+                _digest(context.page_keys),
+            ),
+            protocol=pickle.HIGHEST_PROTOCOL,
+        )
+
+    def unpack_prefetch_context(self, payload, keys):
+        version, operation_id, catalog, layout_ids, manifests, digest = pickle.loads(
+            payload
+        )
+        if version != 1 or catalog.model_domain != self._model_domain:
+            raise ValueError("prefetch context version or model domain differs")
+        if len(layout_ids) > len(keys):
+            raise ValueError("prefetch context exceeds local request")
+        pages = self._page_keys(keys[: len(layout_ids)])
+        if _digest(pages) != digest:
+            raise ValueError("prefetch context does not match local page keys")
+        return KVCacheStoreReadContext(
+            operation_id, catalog, pages, layout_ids, manifests
+        )
+
     def load(self, keys, indices, context, page_offset, cancelled):
         if context is None:
             raise ValueError("KV reshard load requires this prefetch's read context")
@@ -435,31 +478,23 @@ class MooncakeKVReshardAdapter:
         ):
             raise ValueError("prefetch context does not match this batch")
         selected_ids = context.layout_ids[page_offset : page_offset + len(keys)]
-        batch_context = replace(
-            context,
-            page_keys=selected_keys,
-            layout_ids=selected_ids,
-            manifests=tuple(
-                m for m in context.manifests if m.layout.layout_id in selected_ids
-            ),
-        )
+        batch_context = context
+        if page_offset != 0 or len(keys) != len(context.page_keys):
+            batch_context = replace(
+                context,
+                page_keys=selected_keys,
+                layout_ids=selected_ids,
+                manifests=tuple(
+                    m for m in context.manifests if m.layout.layout_id in selected_ids
+                ),
+            )
         slots = self._page_slots(keys, indices)
-        offsets = []
-        for slot in slots:
-            translated = {}
-            for component, tensor in (
-                (KVCacheComponent.KEY, self.pool.k_buffer),
-                (KVCacheComponent.VALUE, self.pool.v_buffer),
-            ):
-                axis = 1 if self.pool.layout == "layer_first" else 0
-                index = (
-                    slot
-                    if self.pool.layout in ("page_first", "layer_first")
-                    else slot // self.pool.page_size
-                )
-                translated[component.value] = (
-                    index * tensor.stride(axis) * tensor.element_size()
-                )
-            offsets.append(translated)
+        offsets = [
+            {
+                key: (slot // self._translation_unit) * step
+                for key, step in self._translation_steps
+            }
+            for slot in slots
+        ]
         count = self.reader.load(batch_context, offsets, cancelled=cancelled)
         return [i < count for i in range(len(keys))]

@@ -1182,6 +1182,65 @@ class HiCacheController:
         # todo: more sophisticated rate limiting based on storage backend performance
         return False
 
+    def _broadcast_storage_context(self, context, page_hashes):
+        # One discovery thread owns this buffer and all of these CPU groups.
+        # A common small frame needs one broadcast per group, including its size.
+        if not hasattr(self, "_storage_context_frame"):
+            data = bytearray(4096)
+            self._storage_context_frame = (
+                data,
+                torch.frombuffer(data, dtype=torch.uint8),
+            )
+        data, tensor = self._storage_context_frame
+        data[:] = bytes(len(data))
+        coordinator = self.tp_rank == 0 and self.pp_rank == 0
+        payload = b""
+        if coordinator and context is not None:
+            try:
+                payload = self.storage_backend.pack_prefetch_context(context)
+                if type(payload) is not bytes or len(payload) > 16 * 1024 * 1024:
+                    raise ValueError("invalid or oversized storage context frame")
+            except Exception:
+                logger.exception("Storage prefetch context encoding failed")
+                payload = b""
+            data[:8] = len(payload).to_bytes(8, "little")
+            if len(payload) <= len(data) - 8:
+                data[8 : 8 + len(payload)] = payload
+        for group in self.prefetch_hits_sync_groups:
+            torch.distributed.broadcast(
+                tensor,
+                src=torch.distributed.get_process_group_ranks(group)[0],
+                group=group,
+            )
+        size = int.from_bytes(data[:8], "little")
+        if size > 16 * 1024 * 1024:
+            raise ValueError("oversized storage context frame")
+        if not size:
+            return None
+        if size > len(data) - 8:
+            # All ranks now know the exact size, including the intermediate
+            # TP sources used to relay into PP. Large frames are never truncated.
+            body = bytearray(payload) if coordinator else bytearray(size)
+            large_tensor = torch.frombuffer(body, dtype=torch.uint8)
+            for group in self.prefetch_hits_sync_groups:
+                torch.distributed.broadcast(
+                    large_tensor,
+                    src=torch.distributed.get_process_group_ranks(group)[0],
+                    group=group,
+                )
+            payload = bytes(body)
+        else:
+            payload = bytes(data[8 : 8 + size])
+        if coordinator:
+            return context
+        try:
+            return self.storage_backend.unpack_prefetch_context(payload, page_hashes)
+        except Exception:
+            # All collectives have completed. The existing hit-count reduction
+            # turns a local validation failure into a miss on every rank.
+            logger.exception("Storage prefetch context decoding failed")
+            return None
+
     def _storage_context_query(self, operation, page_hashes):
         # Every rank participates, including locally cancelled operations. Keep
         # these broadcasts on the existing discovery thread and its CPU groups.
@@ -1193,15 +1252,21 @@ class HiCacheController:
                 )
             except Exception:
                 logger.exception("Storage prefetch discovery failed")
-        values = [context]
-        for group in self.prefetch_hits_sync_groups:
-            torch.distributed.broadcast_object_list(
-                values,
-                src=torch.distributed.get_process_group_ranks(group)[0],
-                group=group,
-            )
-        operation.storage_read_context = values[0]
-        count = len(values[0].page_keys) if values[0] is not None else 0
+        if callable(
+            getattr(self.storage_backend, "pack_prefetch_context", None)
+        ) and callable(getattr(self.storage_backend, "unpack_prefetch_context", None)):
+            context = self._broadcast_storage_context(context, page_hashes)
+        else:
+            values = [context]
+            for group in self.prefetch_hits_sync_groups:
+                torch.distributed.broadcast_object_list(
+                    values,
+                    src=torch.distributed.get_process_group_ranks(group)[0],
+                    group=group,
+                )
+            context = values[0]
+        operation.storage_read_context = context
+        count = len(context.page_keys) if context is not None else 0
         if operation.is_terminated():
             count = 0
         return page_hashes[:count], count * self.page_size
