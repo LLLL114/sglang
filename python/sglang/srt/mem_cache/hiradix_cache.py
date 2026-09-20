@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import atexit
 import heapq
-import json
 import logging
-import os
 import queue
 import threading
 import time
@@ -12,6 +10,9 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.arg_groups.hicache_storage_config import (
+    load_storage_backend_extra_config,
+)
 from sglang.srt.disaggregation.kv_events import StorageMedium
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
@@ -712,35 +713,13 @@ class HiRadixCache(RadixCache):
         Returns:
             tuple: (extra_config_dict, prefetch_threshold, prefetch_timeout_config, hicache_storage_pass_prefix_keys)
         """
-        # Parse extra config if provided. Extra config can be a JSON string or a json/toml/yaml file path prefixed with "@".
-        extra_config = {}
-        if storage_backend_extra_config:
-            try:
-                if storage_backend_extra_config.startswith("@"):
-                    # Read config from a json/toml/yaml file
-                    path = storage_backend_extra_config[1:]
-                    ext = os.path.splitext(path)[1].lower()
-                    with open(path, "rb" if ext == ".toml" else "r") as f:
-                        if ext == ".json":
-                            extra_config = json.load(f)
-                        elif ext == ".toml":
-                            import tomllib
-
-                            extra_config = tomllib.load(f)
-                        elif ext in (".yaml", ".yml"):
-                            import yaml
-
-                            extra_config = yaml.safe_load(f)
-                        else:
-                            raise ValueError(
-                                f"Unsupported config file {path} (config format: {ext})"
-                            )
-                else:
-                    # read config from JSON string
-                    extra_config = json.loads(storage_backend_extra_config)
-            except Exception as e:
-                logger.error(f"Invalid backend extra config JSON: {e}")
-                raise e
+        try:
+            extra_config = load_storage_backend_extra_config(
+                storage_backend_extra_config
+            )
+        except Exception as e:
+            logger.error(f"Invalid backend extra config JSON: {e}")
+            raise
 
         defaults = PrefetchTimeoutConfig()
         prefetch_threshold = extra_config.pop("prefetch_threshold", 256)  # tokens
