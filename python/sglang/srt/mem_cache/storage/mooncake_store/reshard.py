@@ -221,7 +221,26 @@ class MooncakeKVReshardAdapter:
             self.upload_plan.layout,
         )
         self.store = KVCacheStore(native_store, manifest)
-        self.store.register_layout()
+        # Ownership was gathered across all ranks before backend attachment.
+        # Only the request coordinator publishes; serving starts after rank init.
+        if config.tp_rank == 0 and config.pp_rank == 0:
+            self.store.register_layout()
+        self._model_domain = manifest.model_domain
+        self.payload_config = self.store.backend.payload_config()
+        self._pool_signature = self._current_pool_signature()
+        self._upload_suffixes = tuple(
+            key[len("page") :]
+            for key, writer in zip(
+                manifest.object_keys("page"), self.upload_plan.object_writers
+            )
+            if writer == self.participant
+        )
+        self.reader = self.store.prepare_page_reader(
+            self.placement,
+            self.binding(
+                torch.arange(pool.page_size), "page-template:" + self.instance
+            ),
+        )
         logger.info(
             "Mooncake KV reshard registered layout=%s participant=%s catalog=%s",
             manifest.layout.layout_id,
@@ -328,22 +347,72 @@ class MooncakeKVReshardAdapter:
             tuple(ranges),
         )
 
+    def _current_pool_signature(self):
+        return (
+            self.pool.layout,
+            self.pool.page_size,
+            self.pool.size,
+            self.pool.kv_buffer.data_ptr(),
+            tuple(
+                (t.data_ptr(), tuple(t.shape), tuple(t.stride()), t.dtype)
+                for t in (self.pool.k_buffer, self.pool.v_buffer)
+            ),
+        )
+
+    def _page_slots(self, keys, indices):
+        if self._current_pool_signature() != self._pool_signature:
+            raise ValueError(
+                "KV Store pool changed; reattach the backend before transfer"
+            )
+        page_size = self.pool.page_size
+        if indices.ndim != 1 or indices.dtype not in (torch.int32, torch.int64):
+            raise ValueError("HiCache indices must be a one-dimensional integer tensor")
+        if indices.numel() != len(keys) * page_size:
+            raise ValueError("transfer keys and host indices differ")
+        tokens = indices.tolist()
+        slots = tokens[::page_size]
+        for page, slot in enumerate(slots):
+            if slot < 0 or slot + page_size > self.pool.size:
+                raise ValueError("HiCache page outside host pool")
+            if slot % page_size or tokens[
+                page * page_size : (page + 1) * page_size
+            ] != list(range(slot, slot + page_size)):
+                raise ValueError("HiCache page slots must be aligned and contiguous")
+        return slots
+
     def _page_keys(self, keys):
         # Same HiCache hash under different weights/RoPE settings is different KV.
-        return tuple(f"{key}_m{self.store.manifest.model_domain}" for key in keys)
+        return tuple(f"{key}_m{self._model_domain}" for key in keys)
 
-    def upload(self, keys, indices):
-        operation_id = str(uuid.uuid4())
-        if indices.numel() != len(keys) * self.pool.page_size:
-            raise ValueError("upload keys and host indices differ")
-        return list(
-            self.store.upload(
-                self.upload_plan,
-                self._page_keys(keys),
-                self.binding(indices, operation_id),
-                operation_id=operation_id,
-            )
-        )
+    def upload_meta(self, keys, indices):
+        """Use HiCache's existing page buffers; only namespace the object keys."""
+        self._page_slots(keys, indices)
+        if not keys or not self._upload_suffixes:
+            # Replicated GQA heads have one designated writer in the manifest.
+            return [], [], []
+        object_keys = [
+            page + suffix
+            for page in self._page_keys(keys)
+            for suffix in self._upload_suffixes
+        ]
+        pointers, sizes = self.pool.get_page_buffer_meta(indices)
+        if self.pool.layout == "layer_first":
+            # The accessor returns page/layer/K,V. Store objects concatenate
+            # all layers of K, then all layers of V, matching LPHD metadata.
+            layers = self.pool.layer_num
+            pointers = [
+                pointers[start + component : start + 2 * layers : 2]
+                for start in range(0, len(pointers), 2 * layers)
+                for component in (0, 1)
+            ]
+            sizes = [
+                sizes[start + component : start + 2 * layers : 2]
+                for start in range(0, len(sizes), 2 * layers)
+                for component in (0, 1)
+            ]
+        if len(object_keys) != len(pointers) or len(pointers) != len(sizes):
+            raise ValueError("HiCache page buffers differ from Store objects")
+        return object_keys, pointers, sizes
 
     def discover(self, keys, operation_id):
         context = self.store.discover(self._page_keys(keys), operation_id=operation_id)
@@ -374,10 +443,23 @@ class MooncakeKVReshardAdapter:
                 m for m in context.manifests if m.layout.layout_id in selected_ids
             ),
         )
-        count = self.store.load(
-            batch_context,
-            self.placement,
-            self.binding(indices, context.operation_id),
-            cancelled=cancelled,
-        )
+        slots = self._page_slots(keys, indices)
+        offsets = []
+        for slot in slots:
+            translated = {}
+            for component, tensor in (
+                (KVCacheComponent.KEY, self.pool.k_buffer),
+                (KVCacheComponent.VALUE, self.pool.v_buffer),
+            ):
+                axis = 1 if self.pool.layout == "layer_first" else 0
+                index = (
+                    slot
+                    if self.pool.layout in ("page_first", "layer_first")
+                    else slot // self.pool.page_size
+                )
+                translated[component.value] = (
+                    index * tensor.stride(axis) * tensor.element_size()
+                )
+            offsets.append(translated)
+        count = self.reader.load(batch_context, offsets, cancelled=cancelled)
         return [i < count for i in range(len(keys))]

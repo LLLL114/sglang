@@ -1127,21 +1127,26 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
-        if getattr(self, "kv_reshard", None) is not None:
-            try:
-                return self.kv_reshard.upload(self._tag_keys(keys), host_indices)
-            except Exception:
-                logger.exception("Mooncake KV reshard upload failed")
-                return [False] * len(keys)
-
         if self.mem_pool_host.kv_buffer is None:
             # DeepSeek V4's KV anchor is logical only; v2 side pools carry data.
             return [True] * len(keys)
 
-        # Apply config prefix if available.
         keys = self._tag_keys(keys)
+        if getattr(self, "kv_reshard", None) is not None:
+            try:
+                key_strs, buffer_ptrs, buffer_sizes = self.kv_reshard.upload_meta(
+                    keys, host_indices
+                )
+            except Exception:
+                logger.exception("Mooncake KV reshard upload buffers failed")
+                return [False] * len(keys)
+            if not key_strs:
+                return [True] * len(keys)
+        else:
+            key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(
+                keys, host_indices
+            )
 
-        key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
         key_multiplier = len(key_strs) // len(keys)
         group_ids = (
             self._expand_group_ids(keys, key_multiplier)
@@ -1358,15 +1363,22 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         buffer_sizes: List[Any],
         group_ids: Optional[List[str]] = None,
     ) -> List[int]:
-        config = None
+        config = (
+            self.kv_reshard.payload_config
+            if getattr(self, "kv_reshard", None) is not None
+            else None
+        )
         if self._can_use_group_semantics() and group_ids is not None:
             if len(group_ids) != len(key_strs):
                 raise ValueError(
                     "Mooncake group_ids length must match key_strs length: "
                     f"{len(group_ids)} != {len(key_strs)}"
                 )
-            config = self._replicate_config_cls()
-            config.group_ids = group_ids
+            group_config = self._replicate_config_cls()
+            if config is not None:
+                group_config.data_type = config.data_type
+            group_config.group_ids = group_ids
+            config = group_config
 
         if self._uses_multi_buffer(buffer_ptrs):
             config = config or self._replicate_config_cls()
