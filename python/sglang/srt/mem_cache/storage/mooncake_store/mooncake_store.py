@@ -597,6 +597,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     self.mha_suffix = [f"{rank}" for rank in target_ranks]
 
             self.registered_pools = {}
+            self.kv_reshard = None
+            self.supports_prefetch_context = False
 
             self.gb_per_page = None
             self.prefetch_pgs = []
@@ -696,8 +698,28 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         bytes_per_page = mem_pool_host.get_ksize_per_token() * mem_pool_host.page_size
         self.gb_per_page = bytes_per_page / (1 << 30)
+        if getattr(self.storage_config, "kv_reshard_metadata", None) is not None:
+            from sglang.srt.mem_cache.storage.mooncake_store.reshard import (
+                MooncakeKVReshardAdapter,
+            )
+
+            self.kv_reshard = MooncakeKVReshardAdapter(
+                self.store, mem_pool_host, self.storage_config
+            )
+            self.supports_prefetch_context = True
+
+    def prepare_prefetch(self, keys, *, operation_id):
+        return self.kv_reshard.discover(self._tag_keys(keys), operation_id)
+
+    def pack_prefetch_context(self, context):
+        return self.kv_reshard.pack_prefetch_context(context)
+
+    def unpack_prefetch_context(self, payload, keys):
+        return self.kv_reshard.unpack_prefetch_context(payload, self._tag_keys(keys))
 
     def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
+        if self.supports_prefetch_context and host_pool_name != PoolName.KV:
+            raise ValueError("KV Store reshard does not support side pools")
         # KV anchor memory is already registered via register_mem_pool_host().
         # v2 here only registers additional hybrid pools.
         if host_pool_name == PoolName.KV:
@@ -1069,6 +1091,19 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
+        if getattr(self, "kv_reshard", None) is not None:
+            try:
+                return self.kv_reshard.load(
+                    self._tag_keys(keys),
+                    host_indices,
+                    extra_info.prefetch_context if extra_info else None,
+                    extra_info.page_offset if extra_info else 0,
+                    extra_info.cancelled if extra_info else None,
+                )
+            except Exception:
+                logger.exception("Mooncake KV reshard load failed")
+                return [False] * len(keys)
+
         if self.mem_pool_host.kv_buffer is None:
             # DeepSeek V4's KV anchor is logical only; v2 side pools carry data.
             return [True] * len(keys)
@@ -1102,10 +1137,18 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             # DeepSeek V4's KV anchor is logical only; v2 side pools carry data.
             return [True] * len(keys)
 
-        # Apply config prefix if available.
         keys = self._tag_keys(keys)
+        if getattr(self, "kv_reshard", None) is not None:
+            try:
+                return self.kv_reshard.upload_parts(keys, host_indices)
+            except Exception:
+                logger.exception("Mooncake KV Part upload failed")
+                return [False] * len(keys)
+        else:
+            key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(
+                keys, host_indices
+            )
 
-        key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
         key_multiplier = len(key_strs) // len(keys)
         group_ids = (
             self._expand_group_ids(keys, key_multiplier)
@@ -1276,6 +1319,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def batch_exists(
         self, keys, extra_info: Optional[HiCacheStorageExtraInfo] = None
     ) -> int:
+        if getattr(self, "supports_prefetch_context", False):
+            raise RuntimeError(
+                "KV reshard requires prepare_prefetch and its read context"
+            )
+
         # Apply config prefix if available.
         keys = self._tag_keys(keys)
 
@@ -1324,8 +1372,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     "Mooncake group_ids length must match key_strs length: "
                     f"{len(group_ids)} != {len(key_strs)}"
                 )
-            config = self._replicate_config_cls()
-            config.group_ids = group_ids
+            group_config = self._replicate_config_cls()
+            group_config.group_ids = group_ids
+            config = group_config
 
         if self._uses_multi_buffer(buffer_ptrs):
             config = config or self._replicate_config_cls()
