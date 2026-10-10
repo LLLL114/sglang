@@ -8,7 +8,7 @@ import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any, List, Optional, Set
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Set
 
 import torch
 
@@ -38,12 +38,16 @@ class HiCacheStorageConfig:
     tp_lcm_size: Optional[int] = None
     should_split_heads: bool = False
     extra_config: Optional[dict] = None
+    kv_reshard_metadata: Optional[dict] = None
 
 
 @dataclass
 class HiCacheStorageExtraInfo:
     prefix_keys: Optional[List[str]] = None
     extra_info: Optional[dict] = None
+    prefetch_context: Any = None
+    page_offset: int = 0
+    cancelled: Optional[Callable[[], bool]] = None
 
 
 @dataclass(frozen=True)

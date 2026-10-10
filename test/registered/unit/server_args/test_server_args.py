@@ -1567,6 +1567,69 @@ class TestHiCacheArgs(unittest.TestCase):
                     expected_decode_backend=case.get("expected_decode_backend"),
                 )
 
+    def test_mooncake_reshard_preserves_layer_first(self):
+        configs = {
+            "json": '{"kv_reshard":{"model_revision":"test-revision"}}',
+            "yaml": "kv_reshard:\n  model_revision: test-revision\n",
+            "toml": '[kv_reshard]\nmodel_revision = "test-revision"\n',
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            inputs = [configs["json"]]
+            for suffix, value in configs.items():
+                path = os.path.join(directory, "storage." + suffix)
+                with open(path, "w") as stream:
+                    stream.write(value)
+                inputs.append("@" + path)
+            for config in inputs:
+                for backend in ("kernel", "direct"):
+                    with self.subTest(config=config, backend=backend):
+                        args = self._make_args(
+                            enable_hierarchical_cache=True,
+                            hicache_storage_backend="mooncake",
+                            hicache_storage_backend_extra_config=config,
+                            hicache_mem_layout="layer_first",
+                            hicache_io_backend=backend,
+                        )
+                        handle_hicache(args)
+                        self._assert_hicache_fields(
+                            args,
+                            expected_io_backend=backend,
+                            expected_mem_layout="layer_first",
+                        )
+
+    def test_legacy_mooncake_layer_first_still_normalizes(self):
+        for config in (None, "{}", '{"kv_reshard":null}'):
+            for backend, expected in (
+                ("kernel", "page_first"),
+                ("direct", "page_first_direct"),
+            ):
+                with self.subTest(config=config, backend=backend):
+                    args = self._make_args(
+                        enable_hierarchical_cache=True,
+                        hicache_storage_backend="mooncake",
+                        hicache_storage_backend_extra_config=config,
+                        hicache_mem_layout="layer_first",
+                        hicache_io_backend=backend,
+                    )
+                    handle_hicache(args)
+                    self._assert_hicache_fields(
+                        args,
+                        expected_io_backend=backend,
+                        expected_mem_layout=expected,
+                    )
+
+    def test_mooncake_layout_resolution_rejects_invalid_extra_config(self):
+        for config in ("{invalid", "[]", "null"):
+            with self.subTest(config=config):
+                args = self._make_args(
+                    enable_hierarchical_cache=True,
+                    hicache_storage_backend="mooncake",
+                    hicache_storage_backend_extra_config=config,
+                    hicache_mem_layout="layer_first",
+                )
+                with self.assertRaises(ValueError):
+                    handle_hicache(args)
+
     def test_hicache_kernel_keeps_implicit_fa3_decode_backend(self):
         args = self._make_args(
             enable_hierarchical_cache=True,

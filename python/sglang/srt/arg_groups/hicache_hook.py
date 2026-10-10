@@ -6,6 +6,9 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from sglang.srt.arg_groups.hicache_storage_config import (
+    load_storage_backend_extra_config,
+)
 from sglang.srt.arg_groups.overrides import (
     declare_resolution,
     resolving_view,
@@ -143,6 +146,14 @@ def resolve_storage_layout_compatibility(server_args: Any):
         cfg.hicache_storage_backend != "mooncake"
         or cfg.hicache_mem_layout != "layer_first"
     ):
+        return
+
+    extra_config = load_storage_backend_extra_config(
+        cfg.hicache_storage_backend_extra_config
+    )
+    # The typed KV adapter supplies actual layer strides and uses ranged reads.
+    # Full reshard option/model validation still happens before backend attach.
+    if extra_config.get("kv_reshard") is not None:
         return
 
     if cfg.hicache_io_backend == "direct":
