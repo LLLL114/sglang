@@ -227,7 +227,9 @@ class TestGetMhaKvPtrsWithPp(CustomTestCase):
     draft case intact."""
 
     def test_draft_kv_geometry_selects_main_v_block(self):
-        manager = SimpleNamespace(kv_args=SimpleNamespace(prefill_start_layer=0))
+        manager = SimpleNamespace(
+            pp_size=1, kv_args=SimpleNamespace(prefill_start_layer=0)
+        )
         src_kv_ptrs = list(range(30))
         dst_kv_ptrs = list(range(100, 132))
         src_k, src_v, dst_k, dst_v, num_layers = (

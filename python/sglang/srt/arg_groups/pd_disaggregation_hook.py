@@ -161,39 +161,49 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                 f"got '{cfg.disaggregation_transfer_backend}'."
             )
 
-        # Reject features whose role-specific state is not rebuilt on a flip.
-        if cfg.enable_pd_role_switch:
-            view = resolved_view(server_args)
-            unsupported = []
-            if view.ep_size > 1:
-                unsupported.append(f"expert parallelism (--ep-size {view.ep_size})")
-            if view.moe_a2a_backend != "none":
-                unsupported.append(
-                    f"MoE all-to-all (--moe-a2a-backend {view.moe_a2a_backend})"
-                )
-            if view.pp_size > 1:
-                unsupported.append(f"pipeline parallelism (--pp-size {view.pp_size})")
-            if (
-                attn_dp_enabled_of(view)
-                and view.enable_dp_attention_local_control_broadcast
-            ):
-                unsupported.append("DP attention local control broadcast")
-            if view.dcp_size > 1:
-                unsupported.append(
-                    f"decode context parallelism (--dcp-size {view.dcp_size})"
-                )
-            if view.speculative_algorithm is not None:
-                unsupported.append(
-                    "speculative decoding "
-                    f"(--speculative-algorithm {view.speculative_algorithm})"
-                )
-            if unsupported:
-                raise ValueError(
-                    "--enable-pd-role-switch does not rebuild role-specific "
-                    "state for the following features: "
-                    + ", ".join(unsupported)
-                    + ". Remove these options or drop --enable-pd-role-switch."
-                )
+    # Reject features whose role-specific state is not rebuilt on a flip.
+    if cfg.enable_pd_role_switch and (
+        cfg.disaggregation_mode == "prefill"
+        or (cfg.disaggregation_mode == "decode" and cfg.pp_size > 1)
+    ):
+        view = resolved_view(server_args)
+        unsupported = []
+        if view.ep_size > 1:
+            unsupported.append(f"expert parallelism (--ep-size {view.ep_size})")
+        if view.moe_a2a_backend != "none":
+            unsupported.append(
+                f"MoE all-to-all (--moe-a2a-backend {view.moe_a2a_backend})"
+            )
+        if view.pp_size > 1:
+            if view.dp_size > 1 or attn_dp_enabled_of(view):
+                unsupported.append("pipeline parallelism with DP")
+            if view.attn_cp_size > 1:
+                unsupported.append("pipeline parallelism with attention CP")
+            if view.disaggregation_transfer_backend != "mooncake":
+                unsupported.append("pipeline role switching without Mooncake")
+            if envs.SGLANG_DISAGG_STAGING_BUFFER.get():
+                unsupported.append("pipeline role switching with staging buffers")
+        if (
+            attn_dp_enabled_of(view)
+            and view.enable_dp_attention_local_control_broadcast
+        ):
+            unsupported.append("DP attention local control broadcast")
+        if view.dcp_size > 1:
+            unsupported.append(
+                f"decode context parallelism (--dcp-size {view.dcp_size})"
+            )
+        if view.speculative_algorithm is not None:
+            unsupported.append(
+                "speculative decoding "
+                f"(--speculative-algorithm {view.speculative_algorithm})"
+            )
+        if unsupported:
+            raise ValueError(
+                "--enable-pd-role-switch does not rebuild role-specific "
+                "state for the following features: "
+                + ", ".join(unsupported)
+                + ". Remove these options or drop --enable-pd-role-switch."
+            )
 
 
 def _validate_prefill_complete(server_args: ServerArgs) -> None:

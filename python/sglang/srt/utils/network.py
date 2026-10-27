@@ -256,6 +256,7 @@ def get_zmq_socket_on_host(
     socket_type: zmq.SocketType,
     host: Optional[str] = None,
     restrict_peers: bool = False,
+    port: Optional[int] = None,
 ) -> Tuple[int, zmq.Socket]:
     """Create and configure a ZeroMQ socket.
 
@@ -268,9 +269,10 @@ def get_zmq_socket_on_host(
             cross-machine reachability must pass an explicit host.
         restrict_peers: Apply `restrict_zmq_peers`. Off by default because
             disaggregation sockets accept peers from other jobs.
+        port: Rebind a stable endpoint, or choose a random port when omitted.
 
     Returns:
-        Tuple of (port, socket) where port is the randomly assigned TCP port.
+        Tuple of (port, socket) for the bound TCP endpoint.
     """
     socket = context.socket(socket_type)
     config_socket(socket, socket_type)
@@ -283,7 +285,10 @@ def get_zmq_socket_on_host(
         bind_host = f"tcp://[{host}]"
     else:
         bind_host = f"tcp://{host}"
-    port = socket.bind_to_random_port(bind_host)
+    if port is None:
+        port = socket.bind_to_random_port(bind_host)
+    else:
+        socket.bind(f"{bind_host}:{port}")
     return port, socket
 
 

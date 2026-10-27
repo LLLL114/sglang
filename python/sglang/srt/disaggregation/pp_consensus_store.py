@@ -52,6 +52,7 @@ class PPConsensusStore:
     """
 
     def __init__(self, pp_size: int, pp_rank: int, pp_group) -> None:
+        self._closed = False
         self._pp_size = pp_size
         self._pp_rank = pp_rank
         self._pp_group = pp_group
@@ -136,6 +137,9 @@ class PPConsensusStore:
             self._maybe_replicate_to_rank0(_OpKind.DELETE, key)
 
     def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
         if self._pp_rank > 0:
             self._replication_queue.put(None)
         self._zmq_ctx.term()  # This blocks until all zmq socket closed.

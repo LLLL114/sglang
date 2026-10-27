@@ -93,6 +93,7 @@ from sglang.srt.disaggregation.prefill import (
     SchedulerDisaggregationPrefillMixin,
     maybe_release_metadata_buffer,
 )
+from sglang.srt.disaggregation.role_switch_pp import PPRoleSwitchMarker
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     MetadataBuffers,
@@ -1315,6 +1316,8 @@ class Scheduler(
     def init_running_status(self):
         self.tp_size = get_parallel().tp_size
         # Set by a runtime PD role switch to break out of the current event loop.
+        self._pp_role_switch = None
+        self._pp_role_metadata_buffers = None
         self._event_loop_should_restart = False
         # Guards against concurrent/re-entrant PD role switches.
         self._pd_role_switch_in_progress = False
@@ -1502,6 +1505,41 @@ class Scheduler(
         if envs.SGLANG_LOG_GC.get():
             configure_gc_logger()
 
+    def _get_disaggregation_metadata_buffers(
+        self, size, hidden_size, hidden_states_dtype, output_dsa_topk_indices_dim
+    ):
+        reuse = get_disagg().enable_pd_role_switch and get_parallel().pp_size > 1
+        if reuse and self._pp_role_metadata_buffers is not None:
+            buffers = self._pp_role_metadata_buffers
+            if size > buffers.output_ids.shape[0]:
+                raise RuntimeError("PP role switch metadata capacity changed")
+            buffers.reset()
+            self.device_module.synchronize()
+            return buffers
+        if reuse:
+            # Both roles share the wire schema. Allocate for the larger role
+            # once, keeping remote Mooncake MR descriptors valid across flips.
+            decode_multiplier = (
+                8 if is_minimax_sparse(self.model_config.hf_config) else 2
+            )
+            size = max(
+                size,
+                self.max_running_requests * 2,
+                self.req_to_token_pool.size * decode_multiplier,
+            )
+        buffers = MetadataBuffers(
+            size,
+            hidden_size=hidden_size,
+            hidden_states_dtype=hidden_states_dtype,
+            max_sampling_mask_tokens=self.server_args.sampling_mask_max_tokens,
+            custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
+            output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
+            kv_checksum_enabled=get_disagg().disaggregation_enable_kv_checksum,
+        )
+        if reuse:
+            self._pp_role_metadata_buffers = buffers
+        return buffers
+
     def init_disaggregation(self):
         self.mm_receiver = None
         self.disagg_prefill_bootstrap_queue = None
@@ -1571,14 +1609,11 @@ class Scheduler(
             self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
                 buffer_size
             )
-            self.disagg_metadata_buffers = MetadataBuffers(
+            self.disagg_metadata_buffers = self._get_disaggregation_metadata_buffers(
                 buffer_size,
-                hidden_size=disagg_hidden_size,
-                hidden_states_dtype=disagg_hidden_states_dtype,
-                max_sampling_mask_tokens=self.server_args.sampling_mask_max_tokens,
-                custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
-                output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
-                kv_checksum_enabled=get_disagg().disaggregation_enable_kv_checksum,
+                disagg_hidden_size,
+                disagg_hidden_states_dtype,
+                output_dsa_topk_indices_dim,
             )
 
             # The decode requests polling kv cache
@@ -1612,14 +1647,11 @@ class Scheduler(
             self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
                 buffer_size
             )
-            self.disagg_metadata_buffers = MetadataBuffers(
+            self.disagg_metadata_buffers = self._get_disaggregation_metadata_buffers(
                 buffer_size,
-                hidden_size=disagg_hidden_size,
-                hidden_states_dtype=disagg_hidden_states_dtype,
-                max_sampling_mask_tokens=self.server_args.sampling_mask_max_tokens,
-                custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
-                output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
-                kv_checksum_enabled=get_disagg().disaggregation_enable_kv_checksum,
+                disagg_hidden_size,
+                disagg_hidden_states_dtype,
+                output_dsa_topk_indices_dim,
             )
 
             self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(
@@ -2211,6 +2243,19 @@ class Scheduler(
                 if isinstance(req, PauseGenerationReqInput):
                     num_requests_to_process = index
                     break
+        # PP control must keep circulating while later ingress waits for the
+        # role transition. Do not admit work between preflight and teardown.
+        pp_role_switch = getattr(self, "_pp_role_switch", None)
+        if pp_role_switch is not None and get_parallel().pp_rank == 0:
+            if pp_role_switch.request is not None:
+                num_requests_to_process = 0
+            else:
+                for index, req in enumerate(
+                    self._deferred_input_requests[:num_requests_to_process]
+                ):
+                    if isinstance(req, PdRoleSwitchReqInput):
+                        num_requests_to_process = index + 1
+                        break
         recv_reqs = self._deferred_input_requests[:num_requests_to_process]
         del self._deferred_input_requests[:num_requests_to_process]
 
@@ -2248,6 +2293,10 @@ class Scheduler(
 
             if vmm_errors is not None and any(vmm_errors):
                 self._dispatch_tokenized_mm_requests(recv_req, vmm_errors)
+                continue
+
+            if isinstance(recv_req, PPRoleSwitchMarker):
+                self._pp_role_switch.handle_marker(recv_req)
                 continue
 
             output = self._request_dispatcher(recv_req)
@@ -6104,6 +6153,8 @@ class Scheduler(
         return SlowDownReqOutput()
 
     def handle_pd_role_switch(self, recv_req: PdRoleSwitchReqInput):
+        if controller := getattr(self, "_pp_role_switch", None):
+            return controller.enqueue(recv_req)
         return role_switch.handle_pd_role_switch(self, recv_req)
 
     def _sync_disaggregation_mode_to_subcomponents(self):

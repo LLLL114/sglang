@@ -74,6 +74,7 @@ from sglang.srt.runtime_context import (
     get_device,
     get_memory,
     get_observability,
+    get_parallel,
     get_schedule,
     get_spec,
 )
@@ -256,6 +257,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     supports_role_switch = True
     # Bootstrap thread defers the ABORT ack until the transfer worker drains.
     supports_deferred_decode_kv_release = True
+    _reuse_role_switch_registration = False
 
     def __init__(
         self,
@@ -270,8 +272,22 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         _validate_efa_allocator_compatibility(
             enable_custom_mem_pool, custom_mem_pool_type
         )
-        super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        self._reuse_role_switch_registration = (
+            get_parallel().pp_size > 1 and server_args.enable_pd_role_switch
+        )
         self.init_engine()
+        # Fixed decode peers cache this endpoint and register their KV buffers
+        # only once. Keep its identity with the instance's transfer engine.
+        rank_port = (
+            getattr(self.engine, "_pp_pd_rank_port", None)
+            if self._reuse_role_switch_registration
+            else None
+        )
+        super().__init__(
+            args, disaggregation_mode, server_args, is_mla_backend, rank_port=rank_port
+        )
+        if self._reuse_role_switch_registration:
+            self.engine._pp_pd_rank_port = self.rank_port
         self.register_buffer_to_engine()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.max_transfer_batch_indices = (
@@ -319,6 +335,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             # Peers already cleared at registration; skip the per-transfer check.
             self.state_strides_validated: Set[str] = set()
             self.session_lock = threading.Lock()
+            if self._reuse_role_switch_registration:
+                for session, registration in getattr(
+                    self.engine, "_pp_pd_peer_registrations", {}
+                ).items():
+                    self._publish_peer_registration(session, registration)
             self.start_prefill_thread()
             # Determine the number of threads to use for kv sender
             cpu_count = os.cpu_count()
@@ -421,15 +442,34 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
     def register_buffer_to_engine(self):
         regions = self._registerable_regions()
+        if self._reuse_role_switch_registration:
+            previous = getattr(self.engine, "_pp_pd_registered_regions", None)
+            if previous is not None:
+                if previous != frozenset(regions):
+                    raise RuntimeError(
+                        "PP role switch changed registered memory regions"
+                    )
+                return
         if regions:
             ptrs, lens = zip(*regions)
-            self.engine.batch_register(list(ptrs), list(lens))
+            result = self.engine.batch_register(list(ptrs), list(lens))
+            if self._reuse_role_switch_registration and result != 0:
+                raise RuntimeError(
+                    f"PP role switch memory registration failed: {result}"
+                )
+        if self._reuse_role_switch_registration:
+            self.engine._pp_pd_registered_regions = frozenset(regions)
 
     def deregister_buffer_to_engine(self):
-        regions = self._registerable_regions()
-        if regions:
-            ptrs, _ = zip(*regions)
-            self.engine.batch_deregister(list(ptrs))
+        # The fixed KV pool and shared PP metadata live with the scheduler.
+        # Re-registering the same addresses changes rkeys while peers still
+        # cache the old descriptors. Keep these registrations with the shared
+        # transfer engine; its process lifetime releases them at shutdown.
+        if not self._reuse_role_switch_registration:
+            regions = self._registerable_regions()
+            if regions:
+                ptrs, _ = zip(*regions)
+                self.engine.batch_deregister(list(ptrs))
 
         if hasattr(self, "connection_pool"):
             with self.connection_lock:
@@ -440,8 +480,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         KVManager can be discarded during a P<->D role switch.
 
         The KV cache pool memory is owned by the scheduler and is NOT freed
-        here; only mooncake-side registrations / sockets are released.
+        here. PP role-switch registrations stay instance-owned as well; the
+        role's worker threads and sockets are released on every flip.
         """
+        if self._reuse_role_switch_registration and getattr(
+            self, "_deferred_ack_poisoned_rooms", None
+        ):
+            raise RuntimeError(
+                "Cannot switch PP roles after an unsettled Mooncake send"
+            )
         self._stopped = True
 
         # Stop the failed-session probe loop (PREFILL role) if running.
@@ -464,6 +511,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 logger.exception(
                     "Failed to signal mooncake transfer worker on teardown"
                 )
+                if self._reuse_role_switch_registration:
+                    raise
 
         # Shutdown thread pool executors (PREFILL role).
         for executor in getattr(self, "executors", []):
@@ -474,13 +523,23 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 executor.shutdown(wait=False)
             except Exception:
                 logger.exception("Failed to shutdown executor on teardown")
+                if self._reuse_role_switch_registration:
+                    raise
         self.executors = []
 
         # Join workers before touching their sockets: ZMQ sockets aren't
         # thread-safe, so don't close server_socket while a worker may poll it.
         for t in self._worker_threads:
             t.join(timeout=3.0)
+            if self._reuse_role_switch_registration and t.is_alive():
+                raise RuntimeError("Mooncake worker did not stop before PP role switch")
         self._worker_threads = []
+        if (
+            self._reuse_role_switch_registration
+            and self.disaggregation_mode == DisaggregationMode.PREFILL
+        ):
+            # No worker can mutate the peer table after the joins above.
+            self.engine._pp_pd_peer_registrations = self.decode_kv_args_table.copy()
 
         # Drop the queues so their buffered tasks/senders are released too.
         self.transfer_queues = []
@@ -491,12 +550,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 try:
                     sock.close(linger=0)
                 except Exception:
-                    pass
+                    if self._reuse_role_switch_registration:
+                        raise
             for monitor in self._monitor_cache.values():
                 try:
                     monitor.close()
                 except Exception:
-                    pass
+                    if self._reuse_role_switch_registration:
+                        raise
             self._socket_cache.clear()
             self._monitor_cache.clear()
 
@@ -504,6 +565,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self.server_socket.close(linger=0)
         except Exception:
             logger.exception("Failed to close mooncake server_socket during teardown")
+            if self._reuse_role_switch_registration:
+                raise
 
         # destroy() force-closes every socket in the context; plain term()
         # would block waiting on them.
@@ -511,12 +574,16 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self._zmq_ctx.destroy(linger=0)
         except Exception:
             logger.exception("Failed to destroy mooncake zmq context during teardown")
+            if self._reuse_role_switch_registration:
+                raise
 
         # Deregister memory from the transfer engine.
         try:
             self.deregister_buffer_to_engine()
         except Exception:
             logger.exception("Failed to deregister buffers during teardown")
+            if self._reuse_role_switch_registration:
+                raise
 
         logger.info(
             "MooncakeKVManager torn down (was role=%s)",

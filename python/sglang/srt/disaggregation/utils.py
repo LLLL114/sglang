@@ -502,6 +502,12 @@ class MetadataBuffers:
                     device=self.bootstrap_room.device,
                 )
 
+    def reset(self):
+        """Restore initial metadata without changing registered addresses."""
+        for name, value in vars(self).items():
+            if isinstance(value, torch.Tensor):
+                value.fill_(-1 if name == "output_dsa_topk_indices" else 0)
+
     def set_kv_checksum(self, req: Req, digest: int, signature: int) -> None:
         # Slot 0 the digest, slot 1 the layout signature it was taken under;
         # the row is 8 wide for the 64 B RDMA minimum anyway.

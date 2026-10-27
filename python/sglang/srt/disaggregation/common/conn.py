@@ -319,6 +319,8 @@ class CommonKVManager(BaseKVManager):
         disaggregation_mode: DisaggregationMode,
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
+        *,
+        rank_port: Optional[int] = None,
     ):
         self.kv_args = args
         self.kv_cache_dtype_str = args.kv_cache_dtype_str
@@ -398,7 +400,7 @@ class CommonKVManager(BaseKVManager):
             zmq.MAX_SOCKETS, envs.SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS.get()
         )
         self.rank_port, self.server_socket = get_zmq_socket_on_host(
-            self._zmq_ctx, zmq.PULL, host=self.local_ip
+            self._zmq_ctx, zmq.PULL, host=self.local_ip, port=rank_port
         )
         logger.debug(f"kv manager bind to {self.local_ip}:{self.rank_port}")
 
@@ -1719,11 +1721,25 @@ class CommonKVManager(BaseKVManager):
         num_kv_layers = len(src_kv_ptrs) // 2
         end_layer = start_layer + num_kv_layers
         dst_num_total_layers = len(dst_kv_ptrs) // 2
+        num_model_layers = getattr(self.kv_args, "prefill_num_hidden_layers", None)
         src_k_ptrs = src_kv_ptrs[:num_kv_layers]
         src_v_ptrs = src_kv_ptrs[num_kv_layers:]
         if num_kv_layers == dst_num_total_layers:
             dst_k_ptrs = dst_kv_ptrs[:dst_num_total_layers]
             dst_v_ptrs = dst_kv_ptrs[dst_num_total_layers:]
+        elif (
+            self.pp_size > 1
+            and num_model_layers is not None
+            and dst_num_total_layers >= num_model_layers
+        ):
+            # A PP1 decode peer stores the full target K/V blocks, optionally
+            # followed by draft K/V. Uneven PP shards cannot infer the V offset
+            # from divisibility of local and remote buffer counts.
+            dst_k_ptrs = dst_kv_ptrs[start_layer:end_layer]
+            v_ptr_offset = num_model_layers
+            dst_v_ptrs = dst_kv_ptrs[
+                v_ptr_offset + start_layer : v_ptr_offset + end_layer
+            ]
         elif (
             num_kv_layers < dst_num_total_layers
             and dst_num_total_layers % num_kv_layers != 0

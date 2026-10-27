@@ -259,6 +259,9 @@ class PrefillBootstrapQueue:
         kv_args = kv_args_class()
         kv_args.engine_rank = self.tp_rank
         kv_args.pp_rank = self.pp_rank
+        kv_args.prefill_num_hidden_layers = (
+            self.scheduler.model_config.num_hidden_layers
+        )
         kv_args.system_dp_rank = get_parallel().dp_rank
         kv_args.rust_http_port = (
             self.scheduler.rust_server.http_port
@@ -1484,11 +1487,10 @@ class SchedulerDisaggregationPrefillMixin:
             # the full range; only skip this optional early-send optimization.
             return
         # Early-send issues the KV read before this step's forward is enqueued,
-        # but under overlap scheduling the PRIOR step's prefill forward may still
-        # be writing these prefix pages on forward_stream. Record a completion
-        # event now so the transfer worker can wait on those writes before the
-        # RDMA read, instead of racing them.
-        if self.enable_overlap:
+        # but overlap and PP run the prior forward on a separate stream. It may
+        # still be writing these prefix pages. Let the transfer worker wait for
+        # those writes before its RDMA read.
+        if self.enable_overlap or get_parallel().pp_size > 1:
             ev = torch.cuda.Event()
             ev.record(self.forward_stream)
             req.disagg_kv_sender._early_send_wait_event = ev

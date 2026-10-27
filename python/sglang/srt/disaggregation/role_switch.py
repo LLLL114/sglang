@@ -30,14 +30,29 @@ def run_event_loop_supervisor(
     scheduler: Scheduler, dispatch_once: Callable[[Scheduler], None]
 ) -> None:
     """Re-dispatch the scheduler event loop after each runtime role switch."""
-    while True:
-        try:
-            return dispatch_once(scheduler)
-        except PdRoleSwitchRestart:
-            logger.info(
-                "Re-dispatching event loop after PD role switch -> %s",
-                scheduler.disaggregation_mode.value,
-            )
+    from sglang.srt.runtime_context import get_parallel
+
+    controller = None
+    if (
+        get_parallel().pp_size > 1
+        and scheduler.disaggregation_mode != DisaggregationMode.NULL
+    ):
+        from sglang.srt.disaggregation.role_switch_pp import PPRoleSwitch
+
+        controller = PPRoleSwitch(scheduler)
+    scheduler._pp_role_switch = controller
+    try:
+        while True:
+            try:
+                return dispatch_once(scheduler)
+            except PdRoleSwitchRestart:
+                logger.info(
+                    "Re-dispatching event loop after PD role switch -> %s",
+                    scheduler.disaggregation_mode.value,
+                )
+    finally:
+        if controller is not None:
+            controller.close()
 
 
 def handle_pd_role_switch(
@@ -70,45 +85,9 @@ def handle_pd_role_switch(
             old_role=old_role,
             new_role=new_role,
         )
-    if not scheduler.is_fully_idle():
-        return _fail(
-            "instance is not idle; drain all requests before switching",
-            safe_to_restore=True,
-        )
-
-    required_graph_gb = recv_req.decode_cuda_graph_memory_gb
-    # Same condition ensure_decode_cuda_graphs skips on, so the check cannot be
-    # bypassed while the capture still runs.
-    will_capture_graphs = (
-        new_role == "decode" and not scheduler.tp_worker.get_decode_cuda_graph_bs()
-    )
-    if will_capture_graphs and required_graph_gb is None:
-        return _fail(
-            "decode_cuda_graph_memory_gb is required before capturing decode graphs",
-            safe_to_restore=True,
-        )
-    if will_capture_graphs and required_graph_gb is not None:
-        if required_graph_gb < 0:
-            return _fail(
-                "decode_cuda_graph_memory_gb must be non-negative",
-                safe_to_restore=True,
-            )
-        try:
-            available_graph_gb = get_available_gpu_memory(
-                scheduler.device, get_device().gpu_id
-            )
-        except Exception as e:
-            return _fail(
-                f"failed to check decode CUDA graph headroom: {e}",
-                safe_to_restore=True,
-            )
-        if available_graph_gb < required_graph_gb:
-            return _fail(
-                "insufficient decode CUDA graph headroom: "
-                f"required={required_graph_gb:.3f} GB, "
-                f"available={available_graph_gb:.3f} GB",
-                safe_to_restore=True,
-            )
+    rejection = _preflight_reason(scheduler, recv_req, new_role)
+    if rejection is not None:
+        return _fail(*rejection)
 
     if recv_req.prepare_only:
         # The tokenizer checks every DP worker before allowing any teardown.
@@ -164,6 +143,50 @@ def handle_pd_role_switch(
         return _fail(f"role switch raised: {e}")
     finally:
         scheduler._pd_role_switch_in_progress = False
+
+
+def _preflight_reason(scheduler, recv_req, new_role):
+    if not scheduler.is_fully_idle():
+        return (
+            "instance is not idle; drain all requests before switching",
+            True,
+        )
+
+    required_graph_gb = recv_req.decode_cuda_graph_memory_gb
+    # Same condition ensure_decode_cuda_graphs skips on, so the check cannot be
+    # bypassed while the capture still runs.
+    will_capture_graphs = (
+        new_role == "decode" and not scheduler.tp_worker.get_decode_cuda_graph_bs()
+    )
+    if will_capture_graphs and required_graph_gb is None:
+        return (
+            "decode_cuda_graph_memory_gb is required before capturing decode graphs",
+            True,
+        )
+    if will_capture_graphs and required_graph_gb is not None:
+        if required_graph_gb < 0:
+            return (
+                "decode_cuda_graph_memory_gb must be non-negative",
+                True,
+            )
+        try:
+            available_graph_gb = get_available_gpu_memory(
+                scheduler.device, get_device().gpu_id
+            )
+        except Exception as e:
+            return (
+                f"failed to check decode CUDA graph headroom: {e}",
+                True,
+            )
+        if available_graph_gb < required_graph_gb:
+            return (
+                "insufficient decode CUDA graph headroom: "
+                f"required={required_graph_gb:.3f} GB, "
+                f"available={available_graph_gb:.3f} GB",
+                True,
+            )
+
+    return None
 
 
 def _reject_reason(scheduler: Scheduler, new_role: str) -> Optional[Tuple[str, bool]]:
@@ -237,8 +260,10 @@ def _current_kv_manager(scheduler: Scheduler):
 
 
 def teardown_disaggregation(scheduler: Scheduler) -> None:
-    """Release the current role's disaggregation structures (queues, metadata
-    buffers, KV transfer manager) so the other role can be rebuilt."""
+    """Release role-owned queues, indices and the transfer manager.
+
+    PP metadata backing and registrations remain owned by the instance.
+    """
     mode = scheduler.disaggregation_mode
     if mode == DisaggregationMode.PREFILL:
         q = getattr(scheduler, "disagg_prefill_bootstrap_queue", None)
@@ -246,6 +271,13 @@ def teardown_disaggregation(scheduler: Scheduler) -> None:
             km = getattr(q, "kv_manager", None)
             if km is not None:
                 km.teardown()
+                from sglang.srt.disaggregation.pp_consensus_store import (
+                    PPConsensusStore,
+                )
+
+                request_status = getattr(km, "request_status", None)
+                if isinstance(request_status, PPConsensusStore):
+                    request_status.close()
             scheduler.disagg_prefill_bootstrap_queue = None
         scheduler.disagg_prefill_inflight_queue = []
     elif mode == DisaggregationMode.DECODE:

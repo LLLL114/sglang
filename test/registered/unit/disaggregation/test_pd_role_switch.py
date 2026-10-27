@@ -1,11 +1,21 @@
 import concurrent.futures
+import signal
+import threading
+import time
 import unittest
+from datetime import timedelta
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
+
+import torch
+import torch.distributed as dist
 
 from sglang.srt import runtime_context as rc  # noqa: E402
-from sglang.srt.disaggregation import role_switch  # noqa: E402
+from sglang.srt.disaggregation import role_switch, role_switch_pp
+from sglang.srt.disaggregation.common.conn import CommonKVManager
+from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
+from sglang.srt.managers import scheduler_pp_mixin as pp
 from sglang.srt.managers.io_struct import (  # noqa: E402
     PdRoleSwitchReqInput,
     PdRoleSwitchReqOutput,
@@ -346,7 +356,7 @@ class TestPdRoleSwitchReqSerialization(unittest.TestCase):
 class TestPdRoleSwitchStartupValidation(unittest.TestCase):
     """--enable-pd-role-switch only rebuilds the small role-specific disagg
     structures on a flip; the per-role buffers of EP / MoE
-    all-to-all / pipeline parallelism are sized at startup and not rebuilt, so
+    all-to-all are sized at startup and not rebuilt, so
     a flip with those on would silently deadlock. The PD arg hook must reject
     the combination up-front instead of failing at flip time."""
 
@@ -403,10 +413,40 @@ class TestPdRoleSwitchStartupValidation(unittest.TestCase):
             self._run(self._sa(moe_a2a_backend="mori"))
         self.assertIn("MoE all-to-all", str(ctx.exception))
 
-    def test_reject_pipeline_parallelism(self):
-        with self.assertRaises(ValueError) as ctx:
-            self._run(self._sa(pp_size=2))
-        self.assertIn("pipeline parallelism", str(ctx.exception))
+    def test_pipeline_mooncake_role_switch_accepted(self):
+        for role in ("prefill", "decode"):
+            self._run(
+                self._sa(
+                    pp_size=2,
+                    disaggregation_transfer_backend="mooncake",
+                    disaggregation_mode=role,
+                )
+            )
+
+    def test_reject_unsupported_pipeline_combinations(self):
+        for role in ("prefill", "decode"):
+            self._check_unsupported_pipeline_combinations(role)
+
+    def _check_unsupported_pipeline_combinations(self, role):
+        for extra in (
+            {"dp_size": 2},
+            {"tp_size": 2, "attn_dp_size": 2},
+            {"tp_size": 2, "attn_cp_size": 2},
+            {"disaggregation_transfer_backend": "mori"},
+            {"ep_size": 2},
+            {"speculative_algorithm": "EAGLE"},
+        ):
+            with (
+                self.subTest(extra=extra),
+                self.assertRaises(ValueError),
+            ):
+                args = {
+                    "pp_size": 2,
+                    "disaggregation_mode": role,
+                    "disaggregation_transfer_backend": "mooncake",
+                    **extra,
+                }
+                self._run(self._sa(**args))
 
     def test_data_parallel_role_switch_accepted(self):
         self._run(self._sa(dp_size=2))
@@ -495,6 +535,30 @@ class TestMooncakeTeardownNoThreadLeak(unittest.TestCase):
         self.assertEqual(m._worker_threads, [])
         self.assertEqual(m.transfer_queues, [])
         self.assertEqual(m.executors, [])
+
+    def test_pp_teardown_keeps_peer_registration_for_fixed_decode(self):
+        m = MooncakeKVManager.__new__(MooncakeKVManager)
+        m._reuse_role_switch_registration = True
+        m.disaggregation_mode = DisaggregationMode.PREFILL
+        m._worker_threads = []
+        m.server_socket = MagicMock()
+        m._zmq_ctx = MagicMock()
+        m._socket_lock = threading.Lock()
+        m._socket_cache = {}
+        m._monitor_cache = {}
+        m.engine = SimpleNamespace()
+        registration = object()
+        m.decode_kv_args_table = {"fixed-decode": registration}
+        MooncakeKVManager.teardown(m)
+        self.assertEqual(
+            m.engine._pp_pd_peer_registrations, {"fixed-decode": registration}
+        )
+        m.decode_kv_args_table.clear()
+        self.assertIs(m.engine._pp_pd_peer_registrations["fixed-decode"], registration)
+        # A subsequent Decode teardown must keep the saved Prefill peer table.
+        m.disaggregation_mode = DisaggregationMode.DECODE
+        MooncakeKVManager.teardown(m)
+        self.assertIs(m.engine._pp_pd_peer_registrations["fixed-decode"], registration)
 
 
 @unittest.skipUnless(_HAS_MOONCAKE, "mooncake not importable in this environment")
@@ -604,6 +668,30 @@ class TestMooncakeBootstrapThreadRobustness(unittest.TestCase):
         thread.join(timeout=2.0)
         self.assertFalse(thread.is_alive(), "bootstrap thread survived recv error")
         self.assertFalse(self._FlakySocket.fail_next_recv)  # fault consumed
+
+    def test_cached_peer_reconnects_after_port_rebind(self):
+        from sglang.srt.utils.network import get_zmq_socket_on_host
+
+        self._start()
+        self._send_abort(1)
+        self._wait_acks(1)
+        endpoint = self.m.server_socket.getsockopt_string(zmq.LAST_ENDPOINT)
+        port = int(endpoint.rsplit(":", 1)[1])
+        self.m._stopped = True
+        for thread in self.m._worker_threads:
+            thread.join(timeout=3)
+            self.assertFalse(thread.is_alive())
+        self.m.server_socket.close(linger=0)
+        rebound_port, self.m.server_socket = get_zmq_socket_on_host(
+            self._ctx, zmq.PULL, host="127.0.0.1", port=port
+        )
+        self.assertEqual(rebound_port, port)
+        self.m._worker_threads = []
+        self.m._stopped = False
+        self._start()
+        # The remote PUSH socket remains unchanged across the local rebuild.
+        self._send_abort(2)
+        self._wait_acks(2)
 
     def test_exits_promptly_when_stopped_while_idle(self):
         thread = self._start()
@@ -797,6 +885,690 @@ class TestStartupDecodeGraphReuse(unittest.TestCase):
                         runner.init_decode_cuda_graph.assert_called_once_with()
                 finally:
                     rc.reset_context()
+
+
+class Done(Exception):
+    pass
+
+
+class EmptyBatch:
+    def __init__(self, **kwargs):
+        self.batch_is_full = False
+
+    def is_empty(self):
+        return True
+
+
+class TestPPPreflightAndResources(unittest.TestCase):
+    def test_cached_prefix_transfer_waits_for_pp_forward(self):
+        from sglang.srt.disaggregation import prefill
+
+        for pp_size, overlap in ((1, False), (1, True), (2, False)):
+            with self.subTest(pp=pp_size, overlap=overlap):
+                kv = {"value": "computed" if pp_size == 1 and not overlap else "stale"}
+                event = Mock()
+                event.synchronize.side_effect = lambda: kv.update(value="computed")
+                sent = []
+                req = SimpleNamespace(
+                    pending_bootstrap=False,
+                    prefix_len=8,
+                    host_hit_length=0,
+                    start_send_idx=0,
+                    disagg_kv_sender=SimpleNamespace(),
+                )
+
+                def send_chunk(request, **kwargs):
+                    wait_event = getattr(
+                        request.disagg_kv_sender, "_early_send_wait_event", None
+                    )
+                    if wait_event is not None:
+                        wait_event.synchronize()
+                    sent.append(kv["value"])
+
+                s = SimpleNamespace(
+                    enable_staging=False,
+                    enable_overlap=overlap,
+                    token_to_kv_pool_allocator=SimpleNamespace(page_size=1),
+                    forward_stream=object(),
+                    send_kv_chunk=send_chunk,
+                )
+                with (
+                    patch.object(
+                        prefill.envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX,
+                        "get",
+                        return_value=True,
+                    ),
+                    patch.object(
+                        prefill,
+                        "get_parallel",
+                        return_value=SimpleNamespace(pp_size=pp_size),
+                    ),
+                    patch.object(prefill.torch.cuda, "Event", return_value=event),
+                ):
+                    prefill.SchedulerDisaggregationPrefillMixin.maybe_send_cached_prefix_chunk(
+                        s, req
+                    )
+                self.assertEqual(sent, ["computed"])
+                if pp_size > 1 or overlap:
+                    event.record.assert_called_once_with(s.forward_stream)
+
+    def test_pp_chunk_send_waits_for_kv_writes(self):
+        # Model a forward that has enqueued its KV writes on another stream.
+        # Sending a chunk before its event completes would copy stale KV bytes.
+        kv = {"value": "stale"}
+        event = SimpleNamespace(synchronize=lambda: kv.update(value="computed"))
+        sent = []
+
+        def send_chunk(**kwargs):
+            sent.append(kv["value"])
+            raise Done()
+
+        s = SimpleNamespace(
+            pp_loop_size=1,
+            running_mbs=[EmptyBatch()],
+            last_mbs=[None],
+            init_pp_loop_state=lambda: None,
+            ingest_requests=lambda: [],
+            _pp_role_switch=None,
+            pp_group=SimpleNamespace(is_last_rank=True),
+            process_bootstrapped_queue=lambda: None,
+            _pp_pd_get_prefill_transferred_ids=lambda: [],
+            _pp_commit_comm_work=lambda work: None,
+            chunked_req=object(),
+            launch_event=event,
+            process_prefill_chunk=send_chunk,
+        )
+        with patch.object(pp, "get_parallel", return_value=SimpleNamespace(pp_size=2)):
+            with self.assertRaises(Done):
+                pp.SchedulerPPMixin.event_loop_pp_disagg_prefill(s)
+        self.assertEqual(sent, ["computed"])
+
+    def test_restart_drops_old_batch_aliases_before_ready(self):
+        old = object()
+        s = SimpleNamespace(
+            running_batch=old,
+            last_batch=old,
+            cur_batch_for_debug=old,
+            spec_algorithm=SimpleNamespace(is_none=lambda: True),
+            device="cpu",
+        )
+
+        def ready():
+            self.assertIs(s.running_batch, s.running_mbs[0])
+            self.assertIsNone(s.last_batch)
+            self.assertIsNone(s.cur_batch_for_debug)
+
+        s._pp_role_switch = SimpleNamespace(on_loop_started=ready)
+        with (
+            patch.object(
+                pp,
+                "get_parallel",
+                return_value=SimpleNamespace(pp_size=2, pp_async_batch_depth=1),
+            ),
+            patch.object(pp, "ScheduleBatch", EmptyBatch),
+            patch("torch.cuda.is_available", return_value=False),
+        ):
+            pp.SchedulerPPMixin.init_pp_loop_state(s)
+
+    def test_teardown_accepts_backend_without_pp_consensus_store(self):
+        manager = SimpleNamespace(teardown=Mock())
+        scheduler = SimpleNamespace(
+            disaggregation_mode=DisaggregationMode.PREFILL,
+            disagg_prefill_bootstrap_queue=SimpleNamespace(kv_manager=manager),
+            disable_radix_cache=True,
+        )
+        role_switch_pp.role_switch.teardown_disaggregation(scheduler)
+        manager.teardown.assert_called_once()
+        self.assertIsNone(scheduler.disagg_prefill_bootstrap_queue)
+
+    def test_aggregated_pp_keeps_legacy_rejection_path(self):
+        scheduler = SimpleNamespace(disaggregation_mode=DisaggregationMode.NULL)
+        dispatch = Mock(return_value="done")
+        with (
+            patch(
+                "sglang.srt.runtime_context.get_parallel",
+                return_value=SimpleNamespace(pp_size=2),
+            ),
+            patch.object(role_switch_pp, "PPRoleSwitch") as constructor,
+        ):
+            result = role_switch_pp.role_switch.run_event_loop_supervisor(
+                scheduler, dispatch
+            )
+        self.assertEqual(result, "done")
+        constructor.assert_not_called()
+        self.assertIsNone(scheduler._pp_role_switch)
+
+    def test_fatal_switch_reaches_parent_shutdown(self):
+        from sglang.srt.managers import scheduler as module
+
+        parent = Mock()
+        s = SimpleNamespace(
+            server_args=SimpleNamespace(enable_pd_role_switch=True),
+            disaggregation_mode=DisaggregationMode.PREFILL,
+            get_init_info=lambda: {},
+            run_event_loop=lambda: module.dispatch_event_loop(s),
+            metrics_reporter=Mock(),
+            async_d2h_worker=None,
+            gracefully_exit=False,
+        )
+        with (
+            patch.object(module, "load_plugins"),
+            patch.object(module, "publish"),
+            patch.object(module, "spawn_world_rank", return_value=0),
+            patch.object(module, "configure_scheduler_process"),
+            patch.object(
+                module.psutil,
+                "Process",
+                return_value=SimpleNamespace(parent=lambda: parent),
+            ),
+            patch.object(
+                module,
+                "get_observability",
+                return_value=SimpleNamespace(enable_trace=False),
+            ),
+            patch.object(module, "Scheduler", return_value=s),
+            patch.object(
+                module,
+                "_dispatch_event_loop_once",
+                side_effect=RuntimeError("injected phase failure"),
+            ),
+            patch(
+                "sglang.srt.runtime_context.get_parallel",
+                return_value=SimpleNamespace(pp_size=2),
+            ),
+            patch.object(role_switch_pp, "PPRoleSwitch") as controller,
+            patch.object(
+                module.envs.SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION,
+                "get",
+                return_value=False,
+            ),
+        ):
+            module.run_scheduler_process(s.server_args, None, 0, 0, 0, None, Mock())
+        controller.return_value.close.assert_called_once()
+        parent.send_signal.assert_called_once_with(signal.SIGQUIT)
+
+    def test_idle_switch_arms_its_own_watchdog(self):
+        world, markers = object(), object()
+        parallel = SimpleNamespace(world_group=SimpleNamespace(ranks=[0, 1]), tp_size=1)
+        with (
+            patch.object(role_switch_pp, "get_parallel", return_value=parallel),
+            patch.object(
+                role_switch_pp,
+                "get_device",
+                return_value=SimpleNamespace(watchdog_timeout=7),
+            ),
+            patch.object(
+                dist, "new_group", side_effect=[world, markers]
+            ) as create_group,
+            patch.object(dist, "get_rank", return_value=0),
+            patch.object(dist, "get_world_size", return_value=2),
+            patch.object(dist, "destroy_process_group"),
+            patch.object(role_switch_pp, "WatchdogRaw") as watchdog,
+        ):
+            controller = role_switch_pp.PPRoleSwitch(SimpleNamespace())
+            callbacks = watchdog.call_args.kwargs
+            self.assertFalse(callbacks["is_active"]())
+            self.assertEqual(callbacks["get_counter"](), 0)
+            controller.enqueue(PdRoleSwitchReqInput(new_role="decode"))
+            self.assertTrue(callbacks["is_active"]())
+            self.assertEqual(callbacks["get_counter"](), 1)
+            self.assertEqual(callbacks["watchdog_timeout"], 7)
+            self.assertIn("prepare", callbacks["dump_info"]())
+            for call in create_group.call_args_list:
+                self.assertEqual(call.kwargs["timeout"], timedelta(seconds=30))
+            controller.close()
+            self.assertFalse(callbacks["is_active"]())
+
+    def test_every_rank_can_reject(self):
+        controller = role_switch_pp.PPRoleSwitch.__new__(role_switch_pp.PPRoleSwitch)
+        for rank in range(4):
+            for message in (
+                "instance is not idle",
+                "insufficient decode CUDA graph headroom",
+            ):
+                values = [
+                    dict(
+                        old_role="prefill", new_role="decode", graphs=[], rejection=None
+                    )
+                    for _ in range(4)
+                ]
+                values[rank]["rejection"] = (message, True)
+                result = controller._merge_preflight(values)
+                self.assertFalse(result.success)
+                self.assertTrue(result.safe_to_restore)
+                self.assertIn(f"rank {rank}", result.message)
+                self.assertIn(message, result.message)
+
+    def test_consensus_store_closes_threads_and_is_idempotent(self):
+        info = None
+
+        def broadcast(value, src):
+            nonlocal info
+            if value is not None:
+                info = value
+            return info
+
+        for _ in range(3):
+            leader = PPConsensusStore(2, 0, SimpleNamespace(broadcast_object=broadcast))
+            peer = PPConsensusStore(2, 1, SimpleNamespace(broadcast_object=broadcast))
+            try:
+                peer[7] = 1
+                deadline = time.monotonic() + 3
+                while leader.collect(7) != [None, 1] and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertEqual(leader.collect(7), [None, 1])
+            finally:
+                peer.close()
+                peer.close()
+                leader.close()
+                leader.close()
+            self.assertFalse(peer._worker_thread.is_alive())
+            self.assertFalse(leader._worker_thread.is_alive())
+            self.assertTrue(peer._zmq_ctx.closed)
+            self.assertTrue(leader._zmq_ctx.closed)
+
+
+class TestPPInputOrdering(unittest.TestCase):
+    def test_later_ingress_waits_for_role_switch(self):
+        from sglang.srt.managers import scheduler as module
+
+        before, after = object(), object()
+        request = PdRoleSwitchReqInput(new_role="decode")
+        controller = SimpleNamespace(request=None)
+        s = SimpleNamespace(
+            _deferred_input_requests=[],
+            _pp_role_switch=controller,
+            _poll_timeout_aborts=lambda: [],
+            request_receiver=SimpleNamespace(
+                recv_requests=Mock(side_effect=[[before, request, after], [], []])
+            ),
+            process_input_requests=Mock(),
+            metrics_reporter=SimpleNamespace(record_scheduler_active=Mock()),
+        )
+        parallel = SimpleNamespace(pp_rank=0, attn_tp_rank=0, attn_cp_rank=0)
+        with patch.object(module, "get_parallel", return_value=parallel):
+            self.assertEqual(module.Scheduler.ingest_requests(s), [before, request])
+            self.assertEqual(s._deferred_input_requests, [after])
+            controller.request = request
+            self.assertEqual(module.Scheduler.ingest_requests(s), [])
+            self.assertEqual(s._deferred_input_requests, [after])
+            controller.request = None
+            self.assertEqual(module.Scheduler.ingest_requests(s), [after])
+            self.assertEqual(s._deferred_input_requests, [])
+
+
+class TestPPRegisteredBuffers(unittest.TestCase):
+    def manager(self, engine, reuse=True):
+        from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
+
+        manager = MooncakeKVManager.__new__(MooncakeKVManager)
+        manager.engine = engine
+        manager._reuse_role_switch_registration = reuse
+        manager.disaggregation_mode = DisaggregationMode.PREFILL
+        manager.decode_kv_args_table = {}
+        manager.kv_args = SimpleNamespace(
+            kv_data_ptrs=[100],
+            kv_data_lens=[64],
+            aux_data_ptrs=[200],
+            aux_data_lens=[32],
+            state_data_ptrs=[[300]],
+            state_data_lens=[[16]],
+        )
+        manager.connection_pool = {"old": 1}
+        manager.connection_lock = threading.Lock()
+        return manager
+
+    def test_pp_reuses_all_regions_but_legacy_still_deregisters(self):
+        for reuse in (False, True):
+            with self.subTest(reuse=reuse):
+                engine = SimpleNamespace(
+                    batch_register=Mock(return_value=0),
+                    batch_deregister=Mock(return_value=0),
+                )
+                first = self.manager(engine, reuse)
+                first.register_buffer_to_engine()
+                first.deregister_buffer_to_engine()
+                self.assertEqual(first.connection_pool, {})
+                second = self.manager(engine, reuse)
+                second.register_buffer_to_engine()
+                self.assertEqual(engine.batch_register.call_count, 1 if reuse else 2)
+                self.assertEqual(engine.batch_deregister.call_count, 0 if reuse else 1)
+
+    def test_changed_regions_and_failed_registration_are_fatal(self):
+        engine = SimpleNamespace(
+            batch_register=Mock(return_value=0), batch_deregister=Mock()
+        )
+        self.manager(engine).register_buffer_to_engine()
+        changed = self.manager(engine)
+        changed.kv_args.aux_data_ptrs = [201]
+        with self.assertRaisesRegex(RuntimeError, "changed registered"):
+            changed.register_buffer_to_engine()
+        engine.batch_register.assert_called_once()
+        failed = SimpleNamespace(batch_register=Mock(return_value=-1))
+        with self.assertRaisesRegex(RuntimeError, "registration failed"):
+            self.manager(failed).register_buffer_to_engine()
+        self.assertFalse(hasattr(failed, "_pp_pd_registered_regions"))
+
+    def test_unsettled_send_or_live_worker_prevents_reuse(self):
+        engine = SimpleNamespace(
+            batch_register=Mock(return_value=0), batch_deregister=Mock()
+        )
+        poisoned = self.manager(engine)
+        poisoned._deferred_ack_poisoned_rooms = {1}
+        with self.assertRaisesRegex(RuntimeError, "unsettled"):
+            poisoned.teardown()
+        live = self.manager(engine)
+        live.transfer_queues = []
+        live.executors = []
+        thread = SimpleNamespace(join=Mock(), is_alive=lambda: True)
+        live._worker_threads = [thread]
+        with self.assertRaisesRegex(RuntimeError, "did not stop"):
+            live.teardown()
+        engine.batch_deregister.assert_not_called()
+
+    def test_pp_cleanup_errors_propagate(self):
+        for failing in (
+            "queue",
+            "socket",
+            "monitor",
+            "server",
+            "context",
+            "deregister",
+        ):
+            with self.subTest(failing=failing):
+                manager = self.manager(SimpleNamespace())
+                manager.transfer_queues = [Mock()]
+                manager.executors = []
+                manager._worker_threads = []
+                manager._socket_lock = threading.Lock()
+                manager._socket_cache = {"peer": Mock()}
+                manager._monitor_cache = {"peer": Mock()}
+                manager.server_socket = Mock()
+                manager._zmq_ctx = Mock()
+                manager.deregister_buffer_to_engine = Mock()
+                actions = {
+                    "queue": manager.transfer_queues[0].put,
+                    "socket": manager._socket_cache["peer"].close,
+                    "monitor": manager._monitor_cache["peer"].close,
+                    "server": manager.server_socket.close,
+                    "context": manager._zmq_ctx.destroy,
+                    "deregister": manager.deregister_buffer_to_engine,
+                }
+                actions[failing].side_effect = RuntimeError("injected cleanup failure")
+                with self.assertRaisesRegex(RuntimeError, "injected cleanup failure"):
+                    manager.teardown()
+
+    def test_metadata_reuses_addresses_and_resets_contents(self):
+        from sglang.srt.managers import scheduler as module
+
+        for pp_size in (1, 2):
+            s = SimpleNamespace(
+                _pp_role_metadata_buffers=None,
+                max_running_requests=6,
+                req_to_token_pool=SimpleNamespace(size=8),
+                model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+                server_args=SimpleNamespace(sampling_mask_max_tokens=8),
+                token_to_kv_pool_allocator=SimpleNamespace(
+                    get_kvcache=lambda: SimpleNamespace(
+                        maybe_get_custom_mem_pool=lambda: None
+                    )
+                ),
+                device_module=SimpleNamespace(synchronize=Mock()),
+            )
+            with (
+                patch.object(
+                    module,
+                    "get_parallel",
+                    return_value=SimpleNamespace(pp_size=pp_size),
+                ),
+                patch.object(
+                    module,
+                    "get_disagg",
+                    return_value=SimpleNamespace(
+                        enable_pd_role_switch=True,
+                        disaggregation_enable_kv_checksum=True,
+                    ),
+                ),
+                patch.object(module, "is_minimax_sparse", return_value=False),
+            ):
+                first = module.Scheduler._get_disaggregation_metadata_buffers(
+                    s, 12, 16, torch.float32, 4
+                )
+                self.assertEqual(first.output_ids.shape[0], 16 if pp_size > 1 else 12)
+                pointers = first.get_buf_infos()[0]
+                for value in vars(first).values():
+                    if isinstance(value, torch.Tensor):
+                        value.fill_(7)
+                req = SimpleNamespace(metadata_buffer_index=0)
+                first.set_kv_checksum(req, digest=11, signature=13)
+                self.assertEqual(first.get_kv_checksum(0), (11, 13))
+                second = module.Scheduler._get_disaggregation_metadata_buffers(
+                    s, 16, 16, torch.float32, 4
+                )
+                if pp_size > 1:
+                    self.assertIs(first, second)
+                    self.assertEqual(pointers, second.get_buf_infos()[0])
+                    s.device_module.synchronize.assert_called_once()
+                    with self.assertRaisesRegex(RuntimeError, "capacity changed"):
+                        module.Scheduler._get_disaggregation_metadata_buffers(
+                            s, 17, 16, torch.float32, 4
+                        )
+                else:
+                    self.assertIsNot(first, second)
+                    s.device_module.synchronize.assert_not_called()
+                self.assertEqual(second.get_kv_checksum(0), (0, 0))
+                for name, value in vars(second).items():
+                    if isinstance(value, torch.Tensor):
+                        expected = -1 if name == "output_dsa_topk_indices" else 0
+                        self.assertTrue(torch.all(value == expected), name)
+
+
+class TestPPRoleSwitchController(unittest.TestCase):
+    def test_pp_launch_orders_scheduler_writes_after_forward_reads(self):
+        from contextlib import contextmanager
+
+        events = []
+        on_forward_stream = False
+
+        @contextmanager
+        def forward_context():
+            nonlocal on_forward_stream
+            on_forward_stream = True
+            try:
+                yield
+            finally:
+                on_forward_stream = False
+
+        result = SimpleNamespace(
+            can_run_cuda_graph=True,
+            spec_verify_out_cache_loc=None,
+            fpm_timing=None,
+        )
+
+        def forward(*args):
+            events.append("forward_reads")
+            return result
+
+        def fence():
+            self.assertFalse(on_forward_stream)
+            events.append("scheduler_waits_for_reads")
+
+        event = Mock()
+        scheduler = SimpleNamespace(
+            forward_stream_ctx=forward_context(),
+            _pp_wait_forward_dependencies=Mock(),
+            run_batch=forward,
+            device_module=SimpleNamespace(Event=lambda: event, current_stream=Mock()),
+            pp_group=SimpleNamespace(is_last_rank=False),
+            _apply_war_barrier=Mock(side_effect=fence),
+        )
+        metadata = [None]
+        with (
+            patch.object(pp, "set_time_batch"),
+            patch.object(pp, "_pp_snapshot_forward_batch", return_value=object()),
+        ):
+            actual, ready = pp.SchedulerPPMixin._pp_launch_batch(
+                scheduler, 0, SimpleNamespace(reqs=[]), None, metadata, []
+            )
+        events.append("next_scheduler_write")
+        self.assertEqual(
+            events,
+            ["forward_reads", "scheduler_waits_for_reads", "next_scheduler_write"],
+        )
+        scheduler._apply_war_barrier.assert_called_once_with()
+        self.assertIs(actual, result)
+        self.assertIs(ready, event)
+
+    def controller(self):
+        controller = role_switch_pp.PPRoleSwitch.__new__(role_switch_pp.PPRoleSwitch)
+        controller.scheduler = SimpleNamespace(
+            send_control_output=Mock(),
+            _pd_role_switch_in_progress=True,
+            _pd_role_switch_unhealthy=False,
+        )
+        controller.rank = 0
+        controller.size = 2
+        controller.sequence = 1
+        controller.phase = "prepare"
+        controller.request = PdRoleSwitchReqInput(new_role="decode")
+        controller.vote = concurrent.futures.Future()
+        controller.result = None
+        controller.marker_group = object()
+        controller.executor = Mock()
+        return controller
+
+    def test_prepare_vote_must_finish_before_injecting_a_marker(self):
+        controller = self.controller()
+        requests = []
+        parallel = SimpleNamespace(pp_rank=0, tp_group=SimpleNamespace(ranks=[0]))
+        ready = dict(old_role="prefill", new_role="decode", rejection=None, graphs=[])
+        with (
+            patch.object(role_switch_pp, "get_parallel", return_value=parallel),
+            patch.object(dist, "broadcast_object_list"),
+        ):
+            self.assertFalse(controller.poll_inputs(requests))
+            self.assertEqual(requests, [])
+            controller.vote.set_result([ready, ready])
+            self.assertFalse(controller.poll_inputs(requests))
+        self.assertEqual(requests, [role_switch_pp.PPRoleSwitchMarker(1, "drain")])
+        self.assertTrue(controller.draining)
+        controller.scheduler.send_control_output.assert_not_called()
+
+    def test_prepare_only_noop_and_rejection_finish_without_draining(self):
+        for case in ("prepare_only", "same_role", "rejection"):
+            with self.subTest(case=case):
+                controller = self.controller()
+                controller.request.prepare_only = case == "prepare_only"
+                target = "prefill" if case == "same_role" else "decode"
+                controller.request.new_role = target
+                ready = dict(
+                    old_role="prefill", new_role=target, rejection=None, graphs=[]
+                )
+                peer = (
+                    dict(ready, rejection=("busy", True))
+                    if case == "rejection"
+                    else ready
+                )
+                controller.vote.set_result([ready, peer])
+                with (
+                    patch.object(
+                        role_switch_pp,
+                        "get_parallel",
+                        return_value=SimpleNamespace(
+                            pp_rank=0, tp_group=SimpleNamespace(ranks=[0])
+                        ),
+                    ),
+                    patch.object(dist, "broadcast_object_list"),
+                ):
+                    requests = []
+                    self.assertFalse(controller.poll_inputs(requests))
+                self.assertEqual(requests[0].phase, "finish")
+                result = controller.scheduler.send_control_output.call_args.args[0]
+                self.assertEqual(result.success, case != "rejection")
+                self.assertIsNone(controller.request)
+                self.assertFalse(controller.scheduler._pd_role_switch_in_progress)
+
+    def test_empty_valid_slots_and_tails_still_block_drain(self):
+        controller = self.controller()
+        controller.phase = "drain"
+        controller.vote = None
+        controller.after_iteration(([None, []],), (None,))
+        controller.after_iteration(([None, None],), ([],))
+        controller.executor.submit.assert_not_called()
+        controller.after_iteration(([None, None],), (None,))
+        controller.executor.submit.assert_called_once_with(
+            controller._agree, "drained", None
+        )
+
+    def test_remote_destructive_phase_failure_is_fatal(self):
+        for phase in ("teardown", "rebuild", "decode_graphs"):
+            with self.subTest(phase=phase):
+                controller = self.controller()
+                controller._agree = Mock(return_value=[None, "peer failed"])
+                action = Mock()
+                with self.assertRaisesRegex(RuntimeError, phase):
+                    controller._run_phase(phase, action)
+                action.assert_called_once_with()
+                self.assertTrue(controller.scheduler._pd_role_switch_unhealthy)
+                controller.scheduler.send_control_output.assert_not_called()
+
+    def test_restarted_loop_is_acknowledged_before_reply(self):
+        controller = self.controller()
+        controller.phase = "restarting"
+        controller.result = PdRoleSwitchReqOutput(
+            success=True, message="ok", old_role="prefill", new_role="decode"
+        )
+        events = []
+        controller._agree = lambda *args: events.append("restarted")
+        controller.scheduler.send_control_output.side_effect = lambda *args: (
+            events.append("response")
+        )
+        controller.on_loop_started()
+        self.assertEqual(events, ["restarted", "response"])
+        self.assertIsNone(controller.request)
+
+    def test_control_sequence_mismatch_is_rejected(self):
+        controller = self.controller()
+        controller.group = object()
+        for mismatched in ((2, "prepare", None), (1, "drained", None)):
+            with self.subTest(peer=mismatched):
+
+                def gather(values, local, **kwargs):
+                    values[:] = [local, mismatched]
+
+                with patch.object(dist, "all_gather_object", side_effect=gather):
+                    with self.assertRaisesRegex(RuntimeError, "sequence mismatch"):
+                        controller._agree("prepare", None)
+
+
+class TestPPKVMapping(unittest.TestCase):
+    def test_plain_mha_pp_to_pp1_maps_all_k_and_v_layers(self):
+        # Uneven PP shards must not be mistaken for an appended draft model.
+        for pp_size in (3, 4, 5, 6, 7):
+            for draft_layers in (0, 1):
+                dst = list(range(1000, 1064 + 2 * draft_layers))
+                received = []
+                for rank in range(pp_size):
+                    start = 32 * rank // pp_size
+                    end = 32 * (rank + 1) // pp_size
+                    count = end - start
+                    src = list(range(2000, 2000 + count * 2))
+                    manager = SimpleNamespace(
+                        pp_size=pp_size,
+                        kv_args=SimpleNamespace(prefill_start_layer=start),
+                    )
+                    manager.kv_args.prefill_num_hidden_layers = 32
+                    with self.subTest(pp_size=pp_size, rank=rank, draft=draft_layers):
+                        k, v, dst_k, dst_v, layers = (
+                            CommonKVManager.get_mha_kv_ptrs_with_pp(manager, src, dst)
+                        )
+                        self.assertEqual(
+                            (k, v, layers), (src[:count], src[count:], count)
+                        )
+                        self.assertEqual(dst_k, dst[start:end])
+                        self.assertEqual(dst_v, dst[32 + start : 32 + end])
+                        received.extend(dst_k + dst_v)
+                self.assertEqual(sorted(received), dst[:64])
 
 
 if __name__ == "__main__":

@@ -118,6 +118,8 @@ class KVArgs:
     # Only used of npu, for decode total kv layers
     draft_kv_layers: int
     num_draft_entries: int = 0
+    # Full target-model layer count, before an optional decode draft suffix.
+    prefill_num_hidden_layers: Optional[int] = None
 
 
 class KVPoll:

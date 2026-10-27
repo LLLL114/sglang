@@ -10,6 +10,7 @@ import torch
 import torch.distributed
 
 from sglang.srt.disaggregation.base.conn import KVPoll
+from sglang.srt.disaggregation.role_switch import PdRoleSwitchRestart
 from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
 from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
 from sglang.srt.distributed.parallel_state import P2PWork
@@ -271,6 +272,17 @@ class SchedulerPPMixin:
                 next_batch_result = None
 
                 recv_reqs = self.ingest_requests()
+                if (
+                    self._pp_role_switch is not None
+                    and self._pp_role_switch.poll_inputs(recv_reqs)
+                ):
+                    self._pp_finish_role_switch(
+                        recv_reqs,
+                        (
+                            send_transfer_work,
+                            send_release_work,
+                        ),
+                    )
 
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
@@ -281,6 +293,11 @@ class SchedulerPPMixin:
                 self._pp_commit_comm_work(send_transfer_work)
                 tmbs[mb_id] = transferred_rids
 
+                # PP launches on a separate stream and delays result processing.
+                # The non-overlap chunk sender must not let RDMA read KV that
+                # the previous forward is still writing.
+                if self.chunked_req is not None and self.launch_event is not None:
+                    self.launch_event.synchronize()
                 self.process_prefill_chunk(
                     last_batch=self.last_batch, running_batch=self.running_batch
                 )
@@ -357,6 +374,8 @@ class SchedulerPPMixin:
                 release_rids = next_release_rids
 
                 self.running_batch.batch_is_full = False
+                if self._pp_role_switch is not None:
+                    self._pp_role_switch.after_iteration((tmbs,), (release_rids,))
 
             # When the server is idle, self-check and re-init some states
             if server_is_idle:
@@ -400,6 +419,21 @@ class SchedulerPPMixin:
                 next_batch_result = None
 
                 recv_reqs = self.ingest_requests()
+                if (
+                    self._pp_role_switch is not None
+                    and self._pp_role_switch.poll_inputs(recv_reqs)
+                ):
+                    self._pp_finish_role_switch(
+                        recv_reqs,
+                        (
+                            send_retract_work,
+                            send_prealloc_work,
+                            send_transfer_work,
+                            send_consensus_retract_work,
+                            send_consensus_prealloc_work,
+                            send_release_work,
+                        ),
+                    )
 
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
@@ -543,6 +577,11 @@ class SchedulerPPMixin:
                 consensus_prealloc_rids = next_consensus_prealloc_rids
 
                 self.running_batch.batch_is_full = False
+                if self._pp_role_switch is not None:
+                    self._pp_role_switch.after_iteration(
+                        (rmbs, pmbs, tmbs),
+                        (consensus_retract_rids, consensus_prealloc_rids, release_rids),
+                    )
 
             # When the server is idle, self-check and re-init some states
             queue_size = (
@@ -568,6 +607,10 @@ class SchedulerPPMixin:
             ScheduleBatch(reqs=[], batch_is_full=False)
             for _ in range(self.pp_loop_size)
         ]
+        # Drop aliases into the old ring before acknowledging a restarted loop.
+        self.running_batch = self.running_mbs[0]
+        self.last_batch = None
+        self.cur_batch_for_debug = None
         self.mb_metadata: List[Optional[PPBatchMetadata]] = [None] * self.pp_loop_size
         self.pp_outputs: Optional[PPProxyTensors] = None
         self.last_rank_comm_queue: deque[Tuple[torch.Event, PPProxyTensors]] = deque()
@@ -606,12 +649,41 @@ class SchedulerPPMixin:
         self._pp_tensor_dict_inbox: Dict[
             str, deque[Tuple[Dict[str, torch.Tensor], Optional[torch.Event]]]
         ] = defaultdict(deque)
+        if self._pp_role_switch is not None:
+            self._pp_role_switch.on_loop_started()
+
+    def _pp_finish_role_switch(self, requests, pending_work):
+        # The final envelope has no PD metadata following it. Every rank has
+        # drained its old slots before PP0 is allowed to inject this marker.
+        self._pp_commit_comm_work(self.send_req_work)
+        if not self.pp_group.is_last_rank:
+            self.send_req_work = self._pp_send_pyobj_to_next_stage(
+                requests, async_send=True
+            )
+        for work in (
+            *pending_work,
+            self.send_req_work,
+            self.send_proxy_work,
+            self.send_output_work,
+        ):
+            self._pp_commit_comm_work(work)
+        self.device_module.synchronize()
+        self._pp_role_switch.commit()
+        raise PdRoleSwitchRestart()
+
+    def _pp_drain_pd_ids(self):
+        if not self.pp_group.is_first_rank:
+            if self._pp_recv_pyobj_from_prev_stage() is not None:
+                raise RuntimeError("Expected an invalid PP slot while draining")
+        return None
 
     def process_bootstrapped_queue(self: Scheduler):
         reqs = self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
         self.waiting_queue.extend(reqs)
 
     def _pp_pd_get_prefill_transferred_ids(self: Scheduler):
+        if self._pp_role_switch is not None and self._pp_role_switch.draining:
+            return self._pp_drain_pd_ids()
         # get the current stage transfer success
         if self.pp_group.is_first_rank:
             transferred_rids = self.get_rids(
@@ -647,7 +719,14 @@ class SchedulerPPMixin:
         send_consensus_bootstrapped_work = []
         if self.pp_group.is_last_rank:
             if bmbs[next_first_rank_mb_id] is not None:
-                consensus_bootstrapped_rids = bootstrapped_rids
+                # Async depth delays the return slot. While draining, the
+                # current poll is invalid but an older valid (empty) slot still
+                # needs a message, otherwise the next recv reads a request.
+                consensus_bootstrapped_rids = (
+                    bootstrapped_rids
+                    if bootstrapped_rids is not None
+                    else bmbs[next_first_rank_mb_id]
+                )
                 send_consensus_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
                     consensus_bootstrapped_rids, async_send=True
                 )
@@ -669,7 +748,11 @@ class SchedulerPPMixin:
         send_release_work = []
         if self.pp_group.is_last_rank:
             if tmbs[next_first_rank_mb_id] is not None:
-                release_rids = transferred_rids
+                release_rids = (
+                    transferred_rids
+                    if transferred_rids is not None
+                    else tmbs[next_first_rank_mb_id]
+                )
                 send_release_work = self._pp_send_pyobj_to_next_stage(
                     release_rids, async_send=True
                 )
@@ -754,7 +837,7 @@ class SchedulerPPMixin:
                 * get_parallel().attn_tp_size
             )
             p2p_work = point_to_point_pyobj(
-                data,
+                [None] if data is None else data,
                 get_parallel().pp_rank * get_parallel().tp_size + dp_offset,
                 self.world_group.cpu_group,
                 get_parallel().pp_rank * get_parallel().tp_size + dp_offset,
@@ -785,7 +868,8 @@ class SchedulerPPMixin:
             data = None
 
         data = attn_cp_tp_broadcast_pyobj(data)
-        return data
+        # P2P serializes lists; [None] is the wire form of an invalid drain slot.
+        return None if data == [None] else data
 
     def _pp_prepare_tensor_dict(
         self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
@@ -1673,6 +1757,9 @@ class SchedulerPPMixin:
                             ),
                         )
                     )
+        # As in the overlap loops, protect the forward shared reads before
+        # the scheduler can overwrite those buffers for another microbatch.
+        self._apply_war_barrier()
         return result, event
 
     def get_rids(
@@ -1698,6 +1785,8 @@ class SchedulerPPMixin:
         return tuple(rids) if len(rids) > 1 else rids[0]
 
     def _pp_pd_get_retract_ids(self: Scheduler, mb_id: int):
+        if self._pp_role_switch is not None and self._pp_role_switch.draining:
+            return self._pp_drain_pd_ids()
         # communicate pre-consensus retracted reqs
         for req in self.disagg_decode_prealloc_queue.retracted_queue:
             # assign retracted reqs to the current microbatch
@@ -1717,6 +1806,8 @@ class SchedulerPPMixin:
             return list(set(prev_retract_rids) & set(curr_retract_rids))
 
     def _pp_pd_get_prealloc_ids(self: Scheduler):
+        if self._pp_role_switch is not None and self._pp_role_switch.draining:
+            return self._pp_drain_pd_ids()
         # communicate pre-consensus prealloc reqs
         if self.pp_group.is_first_rank:
             # First rank, pop the preallocated reqs from the prealloc queue
@@ -1768,6 +1859,8 @@ class SchedulerPPMixin:
         return good_rids, bad_rids
 
     def _pp_pd_get_decode_transferred_ids(self: Scheduler):
+        if self._pp_role_switch is not None and self._pp_role_switch.draining:
+            return self._pp_drain_pd_ids()
         # get the current stage transfer success
         if self.pp_group.is_first_rank:
             transferred_rids = self.get_rids(
