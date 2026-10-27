@@ -676,6 +676,56 @@ class TestMooncakeBootstrapThreadRobustness(unittest.TestCase):
         self._send_abort(2)
         self._wait_acks(2)
 
+    def test_prefill_drops_late_decode_frames_and_keeps_receiving(self):
+        thread = self._start()
+        for message in (
+            [b"19", b"4", b"0"],  # Old Decode transfer status.
+            [b"AUX_DATA", b"19", b"0", b"0", bytes(4), b""],
+            [b"ABORT_ACK", b"19"],
+            [b"None", b"127.0.0.1", b"1234", b"session"],
+            [b"invalid-room", b"127.0.0.1", b"1234", b"session", b"", b"0", b"", b"1"],
+            [
+                b"None",
+                b"127.0.0.1",
+                b"1234",
+                b"session",
+                b"x",
+                b"",
+                b"",
+                b"0",
+                b"1",
+                b"64",
+            ],
+        ):
+            self._push.send_multipart(message)
+        # The same socket must still process the next valid message.
+        self._send_abort(20)
+        self._wait_acks(1)
+        self.assertTrue(thread.is_alive())
+        self.assertEqual(self.m.request_status, {})
+
+    def test_decode_drops_late_prefill_frames_and_keeps_receiving(self):
+        self.m.apply_prefill_status = Mock()
+        with patch.object(
+            self.m, "_start_heartbeat_checker_thread", return_value=Mock()
+        ):
+            self.m.start_decode_thread()
+        thread = self.m._worker_threads[0]
+        for message in (
+            [b"None", b"127.0.0.1", b"1234", b"session"] + [b""] * 16,
+            [b"ABORT", b"19", b"127.0.0.1", b"1234"],
+            [b"19", b"127.0.0.1", b"1234", b"session", b"", b"0", b"", b"1", b"0", b""],
+        ):
+            self._push.send_multipart(message)
+        self._push.send_multipart([b"20", b"4", b"0"])
+        deadline = time.monotonic() + 3
+        while not self.m.apply_prefill_status.called and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.m.apply_prefill_status.assert_called_once_with(
+            bootstrap_room=20, status=4, prefill_rank=0, failure_reason=None
+        )
+        self.assertTrue(thread.is_alive())
+
     def test_no_message_loss_under_burst(self):
         self._start()
         n = 200

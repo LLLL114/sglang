@@ -3008,7 +3008,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 waiting_req_bytes = recv()
                 if waiting_req_bytes is None:
                     continue
-                room = waiting_req_bytes[0].decode("ascii")
+                try:
+                    room = waiting_req_bytes[0].decode("ascii")
+                except (IndexError, UnicodeDecodeError):
+                    logger.warning("Dropping malformed prefill bootstrap header")
+                    continue
                 # Staging: decode reports consumption watermark back to prefill
                 if room == "WATERMARK":
                     handle_watermark_msg(self._staging_ctx, waiting_req_bytes)
@@ -3019,9 +3023,33 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     continue
                 if self._handle_abort_notification(waiting_req_bytes):
                     continue
-                mooncake_session_id = waiting_req_bytes[3].decode("ascii")
+                # A stable role-switch endpoint can still receive frames meant
+                # for its previous Decode role (status, AUX_DATA, ABORT_ACK).
+                # Do not interpret those frames as a new Prefill registration.
+                min_frames = 10 if room == "None" else 8
+                if len(waiting_req_bytes) < min_frames:
+                    logger.debug(
+                        "Dropping unexpected message in prefill role: header=%r, frames=%d",
+                        room,
+                        len(waiting_req_bytes),
+                    )
+                    continue
+                try:
+                    mooncake_session_id = waiting_req_bytes[3].decode("ascii")
+                    if room == "None":
+                        decode_kv_args = KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
+                    else:
+                        room = int(room)
+                        required_dst_info_num = int(
+                            waiting_req_bytes[7].decode("ascii")
+                        )
+                        transfer_info = TransferInfo.from_zmq(waiting_req_bytes)
+                except (IndexError, ValueError, UnicodeDecodeError, struct.error):
+                    logger.warning(
+                        "Dropping malformed prefill registration or metadata"
+                    )
+                    continue
                 if room == "None":
-                    decode_kv_args = KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
                     decode_kv_args.requires_dcp_relayout = self.requires_dcp_relayout(
                         decode_kv_args.dst_dcp_size,
                         decode_kv_args.dst_dcp_rank,
@@ -3056,14 +3084,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         )
                     continue
                 else:
-                    required_dst_info_num = int(waiting_req_bytes[7].decode("ascii"))
-                    room = int(room)
                     if room not in self.transfer_infos:
                         self.transfer_infos[room] = {}
 
-                    self.transfer_infos[room][mooncake_session_id] = (
-                        TransferInfo.from_zmq(waiting_req_bytes)
-                    )
+                    self.transfer_infos[room][mooncake_session_id] = transfer_info
                     # NOTE: after bootstrapping we can mark the req as waiting for input
                     if len(self.transfer_infos[room]) == required_dst_info_num:
                         self.resolve_kv_replica_factor(self.transfer_infos[room])
