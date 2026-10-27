@@ -2,8 +2,16 @@
 
 Control votes run off the scheduler thread: a stage must keep forwarding the
 old protocol while later stages are still receiving the control request.
+
+Ingress is received but not dispatched during a switch, including aborts and
+generation health checks. Drain externally and allow health-probe deadlines
+to cover this window. Resource phases use --watchdog-timeout (at least 30s)
+as their collective budget; configure it above the longest expected rebuild
+or first graph capture. Progress between phases does not extend a single
+action's watchdog budget.
 """
 
+import logging
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import timedelta
@@ -14,6 +22,8 @@ from sglang.srt.disaggregation import role_switch
 from sglang.srt.managers.io_struct import PdRoleSwitchReqOutput
 from sglang.srt.runtime_context import get_context, get_device, get_parallel
 from sglang.srt.utils.watchdog import WatchdogRaw
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -86,6 +96,14 @@ class PPRoleSwitch:
         self.sequence += 1
         self.request = request
         self._advance_phase("prepare")
+        if self.rank == 0:
+            logger.info(
+                "PP role switch %d requested: target=%s; scheduler ingress, "
+                "including aborts and generation health checks, is deferred "
+                "until the control response",
+                self.sequence,
+                request.new_role,
+            )
 
     def _advance_phase(self, phase):
         self.phase = phase
@@ -264,6 +282,14 @@ class PPRoleSwitch:
 
     def _respond(self):
         self.scheduler.send_control_output(self.result, self.request)
+        if self.rank == 0:
+            logger.info(
+                "PP role switch %d response: success=%s, message=%s; "
+                "deferred scheduler ingress can resume",
+                self.sequence,
+                self.result.success,
+                self.result.message,
+            )
         self.scheduler._pd_role_switch_in_progress = False
         self.request = self.result = self.vote = self.phase = None
 

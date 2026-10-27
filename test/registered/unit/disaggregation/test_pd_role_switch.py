@@ -1567,6 +1567,21 @@ class TestPPRoleSwitchController(unittest.TestCase):
         controller.executor = Mock()
         return controller
 
+    def test_logs_the_ingress_deferral_window(self):
+        controller = self.controller()
+        controller.request = None
+        with self.assertLogs(role_switch_pp.__name__, level="INFO") as captured:
+            controller.enqueue(PdRoleSwitchReqInput(new_role="decode"))
+            controller.result = PdRoleSwitchReqOutput(
+                success=True, message="ready", old_role="prefill", new_role="decode"
+            )
+            controller._respond()
+        text = "\n".join(captured.output)
+        self.assertIn("aborts and generation health checks", text)
+        self.assertIn("is deferred", text)
+        self.assertIn("ingress can resume", text)
+        self.assertIsNone(controller.request)
+
     def test_prepare_vote_must_finish_before_injecting_a_marker(self):
         controller = self.controller()
         requests = []
