@@ -1196,6 +1196,34 @@ class TestPPPreflightAndResources(unittest.TestCase):
 
 
 class TestPPInputOrdering(unittest.TestCase):
+    def test_invalid_slot_does_not_call_payload_equality(self):
+        class Payload:
+            def __eq__(self, other):
+                raise AssertionError("Protocol detection called payload equality")
+
+        parallel = SimpleNamespace(
+            attn_tp_rank=0,
+            attn_cp_rank=0,
+            attn_dp_rank=0,
+            attn_cp_size=1,
+            attn_tp_size=1,
+            pp_rank=1,
+            pp_size=2,
+            tp_size=1,
+        )
+        scheduler = SimpleNamespace(world_group=SimpleNamespace(cpu_group=object()))
+        for data in ([None], [], [Payload()], [torch.tensor([1, 2])], (None,)):
+            with (
+                patch.object(pp, "get_parallel", return_value=parallel),
+                patch.object(pp, "point_to_point_pyobj", return_value=data),
+                patch.object(pp, "attn_cp_tp_broadcast_pyobj", side_effect=lambda x: x),
+            ):
+                actual = pp.SchedulerPPMixin._pp_recv_pyobj_from_prev_stage(scheduler)
+            if isinstance(data, list) and len(data) == 1 and data[0] is None:
+                self.assertIsNone(actual)
+            else:
+                self.assertIs(actual, data)
+
     def test_later_ingress_waits_for_role_switch(self):
         from sglang.srt.managers import scheduler as module
 

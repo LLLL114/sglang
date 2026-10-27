@@ -869,7 +869,11 @@ class SchedulerPPMixin:
 
         data = attn_cp_tp_broadcast_pyobj(data)
         # P2P serializes lists; [None] is the wire form of an invalid drain slot.
-        return None if data == [None] else data
+        return (
+            None
+            if isinstance(data, list) and len(data) == 1 and data[0] is None
+            else data
+        )
 
     def _pp_prepare_tensor_dict(
         self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
