@@ -465,6 +465,33 @@ class TestPdRoleSwitchStartupValidation(unittest.TestCase):
         # The same unsupported feature is fine when role switch is off.
         self._run(self._sa(enable_pd_role_switch=False, moe_a2a_backend="mori"))
 
+    def test_decode_pp1_requires_supported_role_switch_features(self):
+        for extra in (
+            {"speculative_algorithm": "EAGLE"},
+            {"ep_size": 2},
+            {"dcp_size": 2},
+            {"moe_a2a_backend": "mori"},
+            {
+                "tp_size": 2,
+                "attn_dp_size": 2,
+                "enable_dp_attention_local_control_broadcast": True,
+            },
+        ):
+            for enabled in (False, True):
+                with self.subTest(extra=extra, enabled=enabled):
+                    args = self._sa(
+                        disaggregation_mode="decode",
+                        disaggregation_transfer_backend="mooncake",
+                        pp_size=1,
+                        enable_pd_role_switch=enabled,
+                        **extra,
+                    )
+                    if enabled:
+                        with self.assertRaises(ValueError):
+                            self._run(args)
+                    else:
+                        self._run(args)
+
 
 # --- teardown: transfer-worker thread-leak fix + prefix-cache release (radix ON) ---
 import threading  # noqa: E402

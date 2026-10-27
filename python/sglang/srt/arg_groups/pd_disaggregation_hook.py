@@ -162,10 +162,7 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             )
 
     # Reject features whose role-specific state is not rebuilt on a flip.
-    if cfg.enable_pd_role_switch and (
-        cfg.disaggregation_mode == "prefill"
-        or (cfg.disaggregation_mode == "decode" and cfg.pp_size > 1)
-    ):
+    if cfg.enable_pd_role_switch and cfg.disaggregation_mode in ("prefill", "decode"):
         view = resolved_view(server_args)
         unsupported = []
         if view.ep_size > 1:
