@@ -172,6 +172,9 @@ class BaseKVManager(ABC):
 
 
 class BaseKVSender(ABC):
+    # Opt in only when the transfer worker consumes the forwarded KV-ready event.
+    supports_kv_wait_event = False
+
     @abstractmethod
     def __init__(
         self,

@@ -31,7 +31,7 @@ class TransferKVChunk:
     # Set when the staging worker first counts this chunk toward the per-room
     # outstanding count; stays set across re-enqueue on a watermark defer.
     staging_counted: bool = False
-    # Early-send: GPU event to synchronize before reading KV (optional).
+    # GPU event the transfer worker must synchronize before reading source KV.
     wait_event: Optional[object] = None
     # Must complete before reading asynchronously copied host indices.
     indices_event: Optional[object] = None

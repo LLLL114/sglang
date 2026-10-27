@@ -1033,36 +1033,47 @@ class TestPPPreflightAndResources(unittest.TestCase):
                 if pp_size > 1 or overlap:
                     event.record.assert_called_once_with(s.forward_stream)
 
-    def test_pp_chunk_send_waits_for_kv_writes(self):
-        # Model a forward that has enqueued its KV writes on another stream.
-        # Sending a chunk before its event completes would copy stale KV bytes.
-        kv = {"value": "stale"}
-        event = SimpleNamespace(synchronize=lambda: kv.update(value="computed"))
-        sent = []
+    def test_pp_chunk_event_moves_wait_to_capable_sender(self):
+        for capable in (False, True):
+            with self.subTest(capable=capable):
+                kv = {"value": "stale"}
+                event = Mock()
+                event.synchronize.side_effect = lambda: kv.update(value="computed")
+                sender = SimpleNamespace(supports_kv_wait_event=capable)
+                sent = []
 
-        def send_chunk(**kwargs):
-            sent.append(kv["value"])
-            raise Done()
+                def send_chunk(**kwargs):
+                    if capable:
+                        event.synchronize.assert_not_called()
+                        self.assertEqual(kv["value"], "stale")
+                        self.assertIs(sender._early_send_wait_event, event)
+                        # Only the transfer worker waits before reading KV.
+                        sender._early_send_wait_event.synchronize()
+                    sent.append(kv["value"])
+                    raise Done()
 
-        s = SimpleNamespace(
-            pp_loop_size=1,
-            running_mbs=[EmptyBatch()],
-            last_mbs=[None],
-            init_pp_loop_state=lambda: None,
-            ingest_requests=lambda: [],
-            _pp_role_switch=None,
-            pp_group=SimpleNamespace(is_last_rank=True),
-            process_bootstrapped_queue=lambda: None,
-            _pp_pd_get_prefill_transferred_ids=lambda: [],
-            _pp_commit_comm_work=lambda work: None,
-            chunked_req=object(),
-            launch_event=event,
-            process_prefill_chunk=send_chunk,
-        )
-        with patch.object(pp, "get_parallel", return_value=SimpleNamespace(pp_size=2)):
-            with self.assertRaises(Done):
-                pp.SchedulerPPMixin.event_loop_pp_disagg_prefill(s)
-        self.assertEqual(sent, ["computed"])
+                scheduler = SimpleNamespace(
+                    pp_loop_size=1,
+                    running_mbs=[EmptyBatch()],
+                    last_mbs=[None],
+                    init_pp_loop_state=lambda: None,
+                    ingest_requests=lambda: [],
+                    _pp_role_switch=None,
+                    pp_group=SimpleNamespace(is_last_rank=True),
+                    process_bootstrapped_queue=lambda: None,
+                    _pp_pd_get_prefill_transferred_ids=lambda: [],
+                    _pp_commit_comm_work=lambda work: None,
+                    chunked_req=SimpleNamespace(disagg_kv_sender=sender),
+                    launch_event=event,
+                    process_prefill_chunk=send_chunk,
+                )
+                with patch.object(
+                    pp, "get_parallel", return_value=SimpleNamespace(pp_size=2)
+                ):
+                    with self.assertRaises(Done):
+                        pp.SchedulerPPMixin.event_loop_pp_disagg_prefill(scheduler)
+                self.assertEqual(sent, ["computed"])
+                event.synchronize.assert_called_once_with()
 
     def test_restart_drops_old_batch_aliases_before_ready(self):
         old = object()

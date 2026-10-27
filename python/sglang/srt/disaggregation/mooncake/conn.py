@@ -3377,6 +3377,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
 
 class MooncakeKVSender(CommonKVSender):
+    supports_kv_wait_event = True
     supports_host_tensor_indices = True
 
     @mooncake_trace_func(MooncakeRequestStage.MOONCAKE_SEND)

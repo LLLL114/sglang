@@ -2162,6 +2162,8 @@ class MoriKVManager(CommonKVManager):
 
 
 class MoriKVSender(CommonKVSender):
+    supports_kv_wait_event = True
+
     def clear(self) -> None:
         if self.kv_mgr.enable_deferred_decode_kv_release:
             with self.kv_mgr._abort_ack_lock:

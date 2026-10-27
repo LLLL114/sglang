@@ -293,11 +293,15 @@ class SchedulerPPMixin:
                 self._pp_commit_comm_work(send_transfer_work)
                 tmbs[mb_id] = transferred_rids
 
-                # PP launches on a separate stream and delays result processing.
-                # The non-overlap chunk sender must not let RDMA read KV that
-                # the previous forward is still writing.
+                # The event covers KV writes already queued on forward_stream.
+                # Capable backends wait on their worker before reading KV, so
+                # the scheduler can keep preparing the next microbatch.
                 if self.chunked_req is not None and self.launch_event is not None:
-                    self.launch_event.synchronize()
+                    sender = self.chunked_req.disagg_kv_sender
+                    if getattr(sender, "supports_kv_wait_event", False):
+                        sender._early_send_wait_event = self.launch_event
+                    else:
+                        self.launch_event.synchronize()
                 self.process_prefill_chunk(
                     last_batch=self.last_batch, running_batch=self.running_batch
                 )

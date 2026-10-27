@@ -126,6 +126,29 @@ class TestCommonSenderLifecycle(unittest.TestCase):
         self.assertIsNone(last.state_indices)
         self.assertEqual(sender._transfer_num_state_indices, 0)
 
+    def test_pp_kv_event_is_queued_without_waiting_on_the_sender(self):
+        from sglang.srt.disaggregation.mori.conn import MoriKVSender
+        from sglang.srt.disaggregation.nixl.conn import NixlKVSender
+
+        self.assertFalse(NixlKVSender.supports_kv_wait_event)
+        for manager_type, sender_type in (
+            (MooncakeKVManager, MooncakeKVSender),
+            (self.mori_manager, MoriKVSender),
+        ):
+            with self.subTest(backend=manager_type.__name__):
+                self.assertTrue(sender_type.supports_kv_wait_event)
+                sender, manager, chunks = make_sender(
+                    manager_type, sender_type=sender_type
+                )
+                sender.init(2, aux_index=9)
+                event = Mock()
+                sender._early_send_wait_event = event
+                sender.send(np.array([10], dtype=np.int32))
+                sender.send(np.array([11], dtype=np.int32))
+                self.assertIs(chunks.get_nowait().wait_event, event)
+                self.assertIsNone(chunks.get_nowait().wait_event)
+                event.synchronize.assert_not_called()
+
     def test_success_waits_for_deferred_staging_chunk(self):
         sender, manager, _ = make_sender(MooncakeKVManager)
         manager.request_status[42] = KVPoll.Success
