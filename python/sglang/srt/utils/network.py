@@ -288,7 +288,24 @@ def get_zmq_socket_on_host(
     if port is None:
         port = socket.bind_to_random_port(bind_host)
     else:
-        socket.bind(f"{bind_host}:{port}")
+        endpoint = f"{bind_host}:{port}"
+        for attempt in range(3):
+            try:
+                socket.bind(endpoint)
+                break
+            except zmq.ZMQError as exc:
+                if exc.errno != zmq.EADDRINUSE:
+                    socket.close(linger=0)
+                    raise
+                if attempt == 2:
+                    socket.close(linger=0)
+                    raise zmq.ZMQError(
+                        exc.errno,
+                        f"Fixed ZMQ endpoint {endpoint} remains in use after 3 bind "
+                        "attempts; the previous listener may not have released it "
+                        "or another process may have acquired the port",
+                    ) from exc
+                time.sleep(0.1)
     return port, socket
 
 

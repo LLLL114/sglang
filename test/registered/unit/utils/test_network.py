@@ -1,6 +1,7 @@
 """Unit tests for srt/utils/network.py: ZMQ peer allowlist and source pinning."""
 
 import unittest
+from unittest.mock import Mock, patch
 
 import zmq
 
@@ -72,6 +73,59 @@ class TestZmqAllowlistAdmitsPinnedSource(CustomTestCase):
 
     def test_pinned_connect_is_admitted(self):
         self.assertTrue(self._delivered("127.0.0.2"))
+
+
+class TestFixedZmqEndpoint(CustomTestCase):
+    def test_rebinds_same_port_after_previous_listener_releases_it(self):
+        previous, current = zmq.Context(), zmq.Context()
+        try:
+            port, _ = network.get_zmq_socket_on_host(previous, zmq.PULL)
+            with patch.object(
+                network.time, "sleep", side_effect=lambda _: previous.destroy(linger=0)
+            ) as retry:
+                rebound, receiver = network.get_zmq_socket_on_host(
+                    current, zmq.PULL, port=port
+                )
+            self.assertEqual(rebound, port)
+            self.assertEqual(retry.call_count, 1)
+            sender = current.socket(zmq.PUSH)
+            sender.connect(f"tcp://127.0.0.1:{port}")
+            sender.send(b"rebound")
+            self.assertTrue(receiver.poll(2000))
+            self.assertEqual(receiver.recv(), b"rebound")
+        finally:
+            previous.destroy(linger=0)
+            current.destroy(linger=0)
+
+    def test_busy_port_fails_with_bounded_retries_and_endpoint(self):
+        previous, current = zmq.Context(), zmq.Context()
+        try:
+            port, _ = network.get_zmq_socket_on_host(previous, zmq.PULL)
+            with patch.object(network.time, "sleep") as retry:
+                with self.assertRaises(zmq.ZMQError) as error:
+                    network.get_zmq_socket_on_host(current, zmq.PULL, port=port)
+            self.assertEqual(error.exception.errno, zmq.EADDRINUSE)
+            self.assertIn(f"127.0.0.1:{port}", str(error.exception))
+            self.assertIn("3 bind attempts", str(error.exception))
+            self.assertEqual(retry.call_count, 2)
+        finally:
+            previous.destroy(linger=0)
+            current.destroy(linger=0)
+
+    def test_other_bind_errors_are_not_retried(self):
+        context = Mock()
+        socket = context.socket.return_value
+        socket.bind.side_effect = zmq.ZMQError(zmq.EINVAL)
+        with (
+            patch.object(network, "config_socket"),
+            patch.object(network.time, "sleep") as retry,
+        ):
+            with self.assertRaises(zmq.ZMQError) as error:
+                network.get_zmq_socket_on_host(context, zmq.PULL, port=12345)
+        self.assertEqual(error.exception.errno, zmq.EINVAL)
+        socket.bind.assert_called_once()
+        socket.close.assert_called_once_with(linger=0)
+        retry.assert_not_called()
 
 
 if __name__ == "__main__":
