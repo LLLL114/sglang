@@ -1,5 +1,9 @@
 import concurrent.futures
+import os
 import signal
+import subprocess
+import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -1165,17 +1169,17 @@ class TestPPPreflightAndResources(unittest.TestCase):
         parent.send_signal.assert_called_once_with(signal.SIGQUIT)
 
     def test_idle_switch_arms_its_own_watchdog(self):
-        world, markers = object(), object()
+        world, markers, phases = object(), object(), object()
         parallel = SimpleNamespace(world_group=SimpleNamespace(ranks=[0, 1]), tp_size=1)
         with (
             patch.object(role_switch_pp, "get_parallel", return_value=parallel),
             patch.object(
                 role_switch_pp,
                 "get_device",
-                return_value=SimpleNamespace(watchdog_timeout=7),
+                return_value=SimpleNamespace(watchdog_timeout=120),
             ),
             patch.object(
-                dist, "new_group", side_effect=[world, markers]
+                dist, "new_group", side_effect=[world, markers, phases]
             ) as create_group,
             patch.object(dist, "get_rank", return_value=0),
             patch.object(dist, "get_world_size", return_value=2),
@@ -1189,10 +1193,18 @@ class TestPPPreflightAndResources(unittest.TestCase):
             controller.enqueue(PdRoleSwitchReqInput(new_role="decode"))
             self.assertTrue(callbacks["is_active"]())
             self.assertEqual(callbacks["get_counter"](), 1)
-            self.assertEqual(callbacks["watchdog_timeout"], 7)
+            self.assertEqual(callbacks["watchdog_timeout"], 120)
             self.assertIn("prepare", callbacks["dump_info"]())
-            for call in create_group.call_args_list:
+            for call in create_group.call_args_list[:2]:
                 self.assertEqual(call.kwargs["timeout"], timedelta(seconds=30))
+            self.assertEqual(
+                create_group.call_args_list[2].kwargs["timeout"],
+                timedelta(seconds=120),
+            )
+            with patch.object(controller, "_agree", return_value=[None, None]):
+                controller._run_phase("decode_graphs", lambda: None)
+            self.assertEqual(controller.sequence, 1)
+            self.assertGreater(callbacks["get_counter"](), 1)
             controller.close()
             self.assertFalse(callbacks["is_active"]())
 
@@ -1534,11 +1546,13 @@ class TestPPRoleSwitchController(unittest.TestCase):
         controller.rank = 0
         controller.size = 2
         controller.sequence = 1
+        controller.progress = 0
         controller.phase = "prepare"
         controller.request = PdRoleSwitchReqInput(new_role="decode")
         controller.vote = concurrent.futures.Future()
         controller.result = None
         controller.marker_group = object()
+        controller.phase_group = object()
         controller.executor = Mock()
         return controller
 
@@ -1644,6 +1658,64 @@ class TestPPRoleSwitchController(unittest.TestCase):
                 with patch.object(dist, "all_gather_object", side_effect=gather):
                     with self.assertRaisesRegex(RuntimeError, "sequence mismatch"):
                         controller._agree("prepare", None)
+
+
+class TestPPPhaseTimeout(unittest.TestCase):
+    def test_resource_skew_uses_long_group_but_control_still_times_out(self):
+        worker = r"""
+import sys, time
+from datetime import timedelta
+from types import SimpleNamespace
+import torch.distributed as dist
+from sglang.srt.disaggregation.role_switch_pp import PPRoleSwitch
+rank = int(sys.argv[1])
+dist.init_process_group("gloo", init_method="file://" + sys.argv[2], rank=rank,
+                        world_size=2, timeout=timedelta(seconds=20))
+control = dist.new_group(backend="gloo", timeout=timedelta(milliseconds=200))
+phases = dist.new_group(backend="gloo", timeout=timedelta(seconds=5))
+controller = PPRoleSwitch(SimpleNamespace(), group=control, phase_group=phases)
+dist.barrier()
+controller._run_phase("decode_graphs", lambda: time.sleep(0.8 if rank else 0))
+print("RESOURCE_PHASE_PASSED", flush=True)
+dist.barrier()
+if rank:
+    time.sleep(0.8)
+try:
+    controller._agree("prepare", None)
+except RuntimeError:
+    print("CONTROL_TIMEOUT_PASSED", flush=True)
+else:
+    raise AssertionError("Fast control group lost its short timeout")
+controller.close()
+dist.destroy_process_group()
+"""
+        with tempfile.TemporaryDirectory(prefix="pp-phase-budget-") as directory:
+            children = [
+                subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-c",
+                        worker,
+                        str(rank),
+                        os.path.join(directory, "rdzv"),
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+                for rank in range(2)
+            ]
+            try:
+                for child in children:
+                    output, _ = child.communicate(timeout=60)
+                    self.assertEqual(child.returncode, 0, output)
+                    self.assertIn("RESOURCE_PHASE_PASSED", output)
+                    self.assertIn("CONTROL_TIMEOUT_PASSED", output)
+            finally:
+                for child in children:
+                    if child.poll() is None:
+                        child.kill()
+                    child.wait()
 
 
 class TestPPKVMapping(unittest.TestCase):

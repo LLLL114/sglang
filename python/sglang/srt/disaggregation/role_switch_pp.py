@@ -23,11 +23,12 @@ class PPRoleSwitchMarker:
 
 
 class PPRoleSwitch:
-    def __init__(self, scheduler, group=None, marker_group=None):
+    def __init__(self, scheduler, group=None, marker_group=None, phase_group=None):
         self.scheduler = scheduler
         self.group = group
         self.owns_group = group is None
         self.marker_group = marker_group
+        self.phase_group = phase_group if phase_group is not None else group
         if self.owns_group:
             self.group = dist.new_group(
                 ranks=get_parallel().world_group.ranks,
@@ -41,12 +42,22 @@ class PPRoleSwitch:
                 backend="gloo",
                 timeout=timedelta(seconds=30),
             )
+            # A finished rank may wait for a peer's entire resource rebuild or
+            # first graph capture. Keep this budget separate from control votes.
+            self.phase_group = dist.new_group(
+                ranks=get_parallel().world_group.ranks,
+                backend="gloo",
+                timeout=timedelta(
+                    seconds=max(30, get_device().watchdog_timeout or 300)
+                ),
+            )
         self.rank = dist.get_rank(self.group)
         self.size = dist.get_world_size(self.group)
         self.executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="pd-pp-vote"
         )
         self.sequence = 0
+        self.progress = 0
         self.request = None
         self.phase = None
         self.vote = None
@@ -57,7 +68,7 @@ class PPRoleSwitch:
             # reaching the same existing fatal-watchdog path.
             self.watchdog = WatchdogRaw(
                 debug_name="PP PD role switch",
-                get_counter=lambda: self.sequence,
+                get_counter=lambda: self.progress,
                 is_active=lambda: self.request is not None,
                 watchdog_timeout=get_device().watchdog_timeout,
                 dump_info=lambda: f"sequence={self.sequence}, phase={self.phase}",
@@ -74,11 +85,20 @@ class PPRoleSwitch:
             )
         self.sequence += 1
         self.request = request
-        self.phase = "prepare"
+        self._advance_phase("prepare")
+
+    def _advance_phase(self, phase):
+        self.phase = phase
+        self.progress += 1
 
     def _agree(self, phase, local):
         values = [None] * self.size
-        dist.all_gather_object(values, (self.sequence, phase, local), group=self.group)
+        group = (
+            self.phase_group
+            if phase in ("teardown", "rebuild", "decode_graphs", "restarted")
+            else self.group
+        )
+        dist.all_gather_object(values, (self.sequence, phase, local), group=group)
         if any(v[:2] != (self.sequence, phase) for v in values):
             raise RuntimeError("PP role-switch control sequence mismatch")
         return [v[2] for v in values]
@@ -175,7 +195,7 @@ class PPRoleSwitch:
         if marker.phase in ("drain", "finish"):
             self.result = self._merge_preflight(values)
         self.vote = None
-        self.phase = marker.phase
+        self._advance_phase(marker.phase)
         if marker.phase == "finish":
             self._respond()
 
@@ -188,12 +208,15 @@ class PPRoleSwitch:
             self.vote = self.executor.submit(self._agree, "drained", None)
 
     def _run_phase(self, phase, action):
+        self._advance_phase(phase)
         error = None
         try:
             action()
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
+        self.progress += 1
         errors = self._agree(phase, error)
+        self.progress += 1
         if any(errors):
             self.scheduler._pd_role_switch_unhealthy = True
             raise RuntimeError(f"PP role switch failed during {phase}: {errors}")
@@ -210,7 +233,7 @@ class PPRoleSwitch:
         if not self.result.success:
             # The wire has drained, so restart the same role's PP loop before
             # answering the safe rejection; do not discard any role resources.
-            self.phase = "restarting"
+            self._advance_phase("restarting")
             return
         self._run_phase("teardown", lambda: role_switch.teardown_disaggregation(s))
 
@@ -231,11 +254,12 @@ class PPRoleSwitch:
             )
         self.result.message = "ok"
         self.result.safe_to_restore = False
-        self.phase = "restarting"
+        self._advance_phase("restarting")
 
     def on_loop_started(self):
         if self.phase == "restarting":
             self._agree("restarted", None)
+            self.progress += 1
             self._respond()
 
     def _respond(self):
@@ -249,4 +273,5 @@ class PPRoleSwitch:
         if self.owns_group:
             if self.rank < get_parallel().tp_size:
                 dist.destroy_process_group(self.marker_group)
+            dist.destroy_process_group(self.phase_group)
             dist.destroy_process_group(self.group)
