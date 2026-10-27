@@ -133,6 +133,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.ready_batches = deque()
         self.request_receiver = SimpleNamespace(recv_requests=self.recv_requests)
         self._deferred_input_requests = []
+        self._pp_role_switch = None
         self._incoming_requests = []
         self.pause_at = pause_at
         self.resume_at = resume_at

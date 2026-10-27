@@ -2245,7 +2245,7 @@ class Scheduler(
                     break
         # PP control must keep circulating while later ingress waits for the
         # role transition. Do not admit work between preflight and teardown.
-        pp_role_switch = getattr(self, "_pp_role_switch", None)
+        pp_role_switch = self._pp_role_switch
         if pp_role_switch is not None and get_parallel().pp_rank == 0:
             if pp_role_switch.request is not None:
                 num_requests_to_process = 0
@@ -6153,7 +6153,7 @@ class Scheduler(
         return SlowDownReqOutput()
 
     def handle_pd_role_switch(self, recv_req: PdRoleSwitchReqInput):
-        if controller := getattr(self, "_pp_role_switch", None):
+        if controller := self._pp_role_switch:
             return controller.enqueue(recv_req)
         return role_switch.handle_pd_role_switch(self, recv_req)
 

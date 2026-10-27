@@ -62,6 +62,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         s.init_disaggregation = MagicMock()
         s._sync_disaggregation_mode_to_subcomponents = MagicMock()
         s._event_loop_should_restart = False
+        s._pp_role_switch = None
         s._pd_role_switch_in_progress = False
         s._pd_role_switch_unhealthy = False
         s.tp_worker = MagicMock()
