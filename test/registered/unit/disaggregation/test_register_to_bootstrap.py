@@ -5,9 +5,13 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
+import asyncio
+import json
 import unittest
-from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
+from sglang.srt.disaggregation.common.conn import CommonKVBootstrapServer
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.test_utils import CustomTestCase
@@ -25,6 +29,42 @@ class TestRegisterToBootstrap(CustomTestCase):
         )
         override.install()
         self.addCleanup(override.restore)
+
+    @patch("sglang.srt.disaggregation.common.conn.requests.put")
+    def test_bootstrap_route_tracks_role_switch_generation(self, mock_put):
+        mock_put.return_value.status_code = 200
+        with patch("sglang.srt.disaggregation.common.conn.threading.Thread"):
+            server = CommonKVBootstrapServer("127.0.0.1", 8765)
+        manager = self._make_manager()
+        manager.kv_layout = None
+        manager.dsv41_spec_layout = None
+        query = dict(
+            prefill_dp_rank="0",
+            prefill_cp_rank="0",
+            target_tp_rank="0",
+            target_pp_rank="0",
+        )
+
+        async def register_and_read():
+            for generation in (None, "first", "second"):
+                manager.bootstrap_generation = generation
+                manager.register_to_bootstrap()
+                payload = mock_put.call_args.kwargs["json"]
+                response = await server._handle_route_put(
+                    SimpleNamespace(json=AsyncMock(return_value=payload))
+                )
+                self.assertEqual(response.status, 200)
+                response = await server._handle_route_get(SimpleNamespace(query=query))
+                data = json.loads(response.text)
+                self.assertEqual(data["rank_port"], manager.rank_port)
+                if generation is None:
+                    self.assertNotIn("generation", payload)
+                    self.assertNotIn("generation", data)
+                else:
+                    self.assertEqual(payload["generation"], generation)
+                    self.assertEqual(data["generation"], generation)
+
+        asyncio.run(register_and_read())
 
     @patch("sglang.srt.disaggregation.common.conn.time")
     @patch("sglang.srt.disaggregation.common.conn.requests.put")
@@ -207,6 +247,7 @@ class TestRegisterToBootstrap(CustomTestCase):
         mgr.system_dp_rank = 0
         mgr.local_ip = "127.0.0.1"
         mgr.rank_port = 12345
+        mgr.bootstrap_generation = None
 
         mgr.kv_args = MagicMock()
         mgr.kv_args.page_size = 16

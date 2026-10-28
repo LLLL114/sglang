@@ -88,6 +88,70 @@ def _fetching_receiver(connection_pool):
 
 
 class TestReceiverConnectionPool(CustomTestCase):
+    def test_role_switch_refreshes_only_changed_peer_registrations(self):
+        key = "prefill:8998_0_0_0"
+        for name, old_generation, new_generation, new_port, fetches, registers in (
+            ("fixed role", None, None, 1001, 0, 0),
+            ("same manager", "first", "first", 1001, 1, 0),
+            ("new endpoint", "first", "second", 2001, 1, 1),
+            ("reused endpoint", "first", "second", 1001, 1, 1),
+        ):
+            with self.subTest(name=name):
+                old = dict(
+                    rank_ip="10.0.0.1", rank_port=1001, pp_rank=0, is_dummy=False
+                )
+                fresh = dict(old, rank_port=new_port)
+                if old_generation:
+                    old["generation"] = old_generation
+                    fresh["generation"] = new_generation
+                stale = [old]
+                unrelated = [dict(rank_ip="10.0.0.2", rank_port=3001)]
+                pool = {key: stale, "other:8998_0_0_0": unrelated}
+                receiver = _fetching_receiver(pool)
+                receiver._get_bootstrap_info_from_server = Mock(return_value=fresh)
+                receiver._register_kv_args = Mock(return_value=True)
+                with patch.object(
+                    CommonKVReceiver, "disconnect_endpoint"
+                ) as disconnect:
+                    receiver._setup_bootstrap_infos()
+                self.assertEqual(
+                    receiver._get_bootstrap_info_from_server.call_count, fetches
+                )
+                self.assertEqual(receiver._register_kv_args.call_count, registers)
+                self.assertEqual(receiver.bootstrap_infos, [fresh])
+                self.assertIs(pool["other:8998_0_0_0"], unrelated)
+                if registers:
+                    disconnect.assert_called_once_with("tcp://10.0.0.1:1001")
+                    self.assertIsNot(pool[key], stale)
+                    # A late failure from the old request cannot erase the replacement.
+                    _receiver(pool, {key: stale}).invalidate_cached_bootstrap_infos()
+                    self.assertEqual(pool[key], [fresh])
+                else:
+                    disconnect.assert_not_called()
+                    self.assertIs(pool[key], stale)
+
+    def test_role_switch_refresh_failure_does_not_reuse_old_endpoint(self):
+        key = "prefill:8998_0_0_0"
+        for lookup_failed in (True, False):
+            with self.subTest(lookup_failed=lookup_failed):
+                old = dict(rank_ip="10.0.0.1", rank_port=1001, generation="old")
+                pool = {key: [old]}
+                receiver = _fetching_receiver(pool)
+                receiver.kv_mgr.record_failure = Mock()
+                receiver.kv_mgr.update_status = Mock()
+                receiver._get_bootstrap_info_from_server = Mock(
+                    return_value=None if lookup_failed else dict(old, generation="new")
+                )
+                receiver._register_kv_args = Mock(return_value=False)
+                with patch.object(CommonKVReceiver, "disconnect_endpoint"):
+                    receiver._setup_bootstrap_infos()
+                self.assertNotIn(key, pool)
+                if lookup_failed:
+                    self.assertEqual(receiver.conclude_state, KVPoll.Failed)
+                    receiver._register_kv_args.assert_not_called()
+                else:
+                    receiver._register_kv_args.assert_called_once()
+
     def test_next_receiver_refetches_after_invalidation(self):
         stale = [{"rank_ip": "10.0.0.1", "rank_port": 1001}]
         connection_pool = {"prefill:8998_0_0_0": stale}

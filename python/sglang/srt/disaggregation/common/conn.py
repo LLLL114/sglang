@@ -6,6 +6,7 @@ import dataclasses
 import logging
 import threading
 import time
+import uuid
 from collections import defaultdict
 from contextlib import nullcontext
 from typing import (
@@ -167,6 +168,7 @@ class PrefillServerInfo:
 class PrefillRankInfo:
     rank_ip: str
     rank_port: int
+    generation: Optional[str] = None
 
     def __post_init__(self):
         self.rank_ip = str(self.rank_ip)
@@ -399,6 +401,11 @@ class CommonKVManager(BaseKVManager):
         )
         self.rank_port, self.server_socket = get_zmq_socket_on_host(
             self._zmq_ctx, zmq.PULL, host=self.local_ip
+        )
+        # A role rebuild may even reuse the old port; registrations belong to
+        # this manager, not just its network address.
+        self.bootstrap_generation = (
+            uuid.uuid4().hex if server_args.enable_pd_role_switch else None
         )
         logger.debug(f"kv manager bind to {self.local_ip}:{self.rank_port}")
 
@@ -1607,6 +1614,8 @@ class CommonKVManager(BaseKVManager):
         payload["decode_allocation_policy"] = (
             get_disagg().disaggregation_decode_allocation_policy
         )
+        if self.bootstrap_generation is not None:
+            payload["generation"] = self.bootstrap_generation
 
         if envs.SGLANG_RUST_SERVER.get() and self.attn_dp_size > 1:
             topology_rows = get_parallel().world_group.all_gather_object(payload)
@@ -2617,7 +2626,16 @@ class CommonKVReceiver(BaseKVReceiver):
             with self.kv_mgr.connection_lock:
                 cached_bootstrap_infos = self.kv_mgr.connection_pool.get(bootstrap_key)
 
-            if cached_bootstrap_infos is None:
+            # Switchable peers keep their bootstrap HTTP address while their
+            # KVManager changes. Validate before publishing request metadata;
+            # a successful heartbeat alone cannot detect this replacement.
+            refresh = cached_bootstrap_infos is not None and any(
+                info.get("generation") for info in cached_bootstrap_infos
+            )
+            if refresh:
+                self._connection_pool_entries[bootstrap_key] = cached_bootstrap_infos
+
+            if cached_bootstrap_infos is None or refresh:
                 bootstrap_infos = []
                 for target_tp_rank in self.target_tp_ranks:
                     # Enable higher PP ranks to be bootstrapped earlier to make PP PD requests bootstrap more robust
@@ -2655,23 +2673,36 @@ class CommonKVReceiver(BaseKVReceiver):
                             self.invalidate_cached_bootstrap_infos()
                             return
 
+                if refresh and bootstrap_infos != cached_bootstrap_infos:
+                    stale_infos = []
+                    with self.kv_mgr.connection_lock:
+                        if (
+                            self.kv_mgr.connection_pool.get(bootstrap_key)
+                            is cached_bootstrap_infos
+                        ):
+                            del self.kv_mgr.connection_pool[bootstrap_key]
+                            stale_infos = cached_bootstrap_infos
+                    for info in stale_infos:
+                        endpoint = NetworkAddress(
+                            info["rank_ip"], info["rank_port"]
+                        ).to_tcp()
+                        self.disconnect_endpoint(endpoint)
+                    cached_bootstrap_infos = None
+
                 self.bootstrap_infos = bootstrap_infos
-                self._connection_pool_entries[bootstrap_key] = self.bootstrap_infos
+                if cached_bootstrap_infos is None:
+                    self._connection_pool_entries[bootstrap_key] = self.bootstrap_infos
+                    # Publish only after registration succeeds. Unchanged peers
+                    # retain both their cached entry and backend registration.
+                    if not self._register_kv_args():
+                        self.invalidate_cached_bootstrap_infos()
+                        return
 
-                # Register kv_args only once to prefill KVManager according to the info fetched
-                # from the bootstrap server. Do this before caching in connection_pool so a failed
-                # registration does not leave a stale entry that later requests would reuse.
-                if not self._register_kv_args():
-                    self.invalidate_cached_bootstrap_infos()
-                    return
-
-                with self.kv_mgr.connection_lock:
-                    cached_bootstrap_infos = self.kv_mgr.connection_pool.setdefault(
-                        bootstrap_key, self.bootstrap_infos
-                    )
-
-                if cached_bootstrap_infos is not self.bootstrap_infos:
-                    self.bootstrap_infos = cached_bootstrap_infos
+                    with self.kv_mgr.connection_lock:
+                        cached_bootstrap_infos = self.kv_mgr.connection_pool.setdefault(
+                            bootstrap_key, self.bootstrap_infos
+                        )
+                self.bootstrap_infos = cached_bootstrap_infos
             else:
                 self.bootstrap_infos = cached_bootstrap_infos
 
@@ -3170,6 +3201,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             tp_group_table[pp_rank] = PrefillRankInfo(
                 rank_ip=rank_ip,
                 rank_port=rank_port,
+                generation=data.get("generation"),
             )
 
             self._registered_count += 1
@@ -3253,7 +3285,10 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 status=404,
             )
 
-        return web.json_response(dataclasses.asdict(bootstrap_info), status=200)
+        payload = dataclasses.asdict(bootstrap_info)
+        if bootstrap_info.generation is None:
+            payload.pop("generation")
+        return web.json_response(payload, status=200)
 
     async def _handle_register_dp_rank(self, request: web.Request):
         data = await request.json()
