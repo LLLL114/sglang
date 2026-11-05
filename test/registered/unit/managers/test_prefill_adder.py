@@ -875,7 +875,7 @@ class TestPrefillAdder(CustomTestCase):
         self.mock_tree_cache.disable = True
         self.mock_token_allocator.page_size = 16
         self.mock_token_allocator.shard_spec = SimpleNamespace(
-            max_prefix_tokens=1024, chunk_tokens=1024
+            max_prefix_tokens=1024, chunk_tokens=1024, gather_prefix=True
         )
         self.mock_token_allocator.available_size.return_value = 64
         adder = self.create_adder(self.create_running_batch(), page_size=16)
@@ -936,6 +936,13 @@ class TestPrefillAdder(CustomTestCase):
         req.prefix_len = prefix_len
         req.full_untruncated_fill_ids = list(range(prefix_len + extend_len))
         return req
+
+    def test_local_page_dcp_does_not_reserve_prefix_gather_scratch(self):
+        spec = PageShardSpec(0, 2, 4, 0, 0, gather_prefix=False)
+        adder = self.create_sharded_adder(shard_spec=spec)
+        self.assertIsNone(adder.kv_shard_scratch_spec)
+        self.assertTrue(adder._kv_shard_reserve_scratch(prefix_len=4096, extend_len=16))
+        self.assertEqual(adder.per_req_token_overhead, 8)
 
     def test_sharded_admission_defers_prefix_scratch_overflow(self):
         adder = self.create_sharded_adder()

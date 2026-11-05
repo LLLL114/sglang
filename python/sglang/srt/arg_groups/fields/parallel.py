@@ -60,6 +60,15 @@ class Parallel(msgspec.Struct):
             aliases=["--decode-context-parallel-size"],
         ),
     ] = 1
+    dcp_kv_layout: A[
+        str,
+        Arg(
+            help="KV ownership layout for decode context parallelism: 'token' "
+            "keeps token interleaving; experimental 'page' uses the prefill "
+            "page-sharded allocator with eager CUDA Triton GQA.",
+            choices=["token", "page"],
+        ),
+    ] = "token"
     pp_size: A[
         int,
         Arg(

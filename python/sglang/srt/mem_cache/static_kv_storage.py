@@ -240,13 +240,20 @@ class StaticKVStorage:
         make_room: Callable[[int], Any],
     ) -> Optional[torch.Tensor]:
         allocator = self._allocator
-        # Over estimate the number of tokens: assume each request needs a new page.
-        make_room(len(seq_lens) * allocator.page_size)
+        extra_alloc_kwargs = {}
+        if page_interleave_shard_size(allocator) > 1:
+            bases = _kv_shard_rotation_bases(
+                self._tree_cache, self._batch, seq_lens_cpu - 1
+            )
+            make_room(allocator.get_decode_allocation_demand(seq_lens_cpu, bases))
+            extra_alloc_kwargs["rotation_bases"] = bases
+        else:
+            # Over estimate: each request may need a new page.
+            make_room(len(seq_lens) * allocator.page_size)
 
         # DSV4-NPU allocator also needs req_pool_indices for C128 KV allocation and
         # returns a DSV4OutCacheLoc bundle; hasattr-gated so others stay unchanged.
         is_dsv4 = rows is not None and hasattr(allocator, "c128_attn_allocator")
-        extra_alloc_kwargs = {}
         if is_dsv4:
             c128_num_pages = allocator.c128_num_pages_needed(
                 (seq_lens_cpu - 1).clamp(min=0), seq_lens_cpu

@@ -14,6 +14,7 @@ from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, enter_scope, published_topology
 from sglang.test.unified_allocator_fixtures import arena_of, stand_in_views
@@ -153,6 +154,17 @@ class TestDcpLogicalCapacity(CustomTestCase):
         runner.swa_max_total_num_tokens = 16
         self.assertEqual(runner.logical_max_total_num_tokens, 64)
         self.assertEqual(runner.effective_logical_max_total_num_tokens, 32)
+
+    def test_page_dcp_does_not_widen_logical_worker_capacity_twice(self):
+        worker = self.make_worker(2)
+        worker.model_runner.max_total_num_tokens = 64
+        allocator = PageInterleavePoolAllocator.__new__(PageInterleavePoolAllocator)
+        allocator.shard_size = 2
+        worker.model_runner.token_to_kv_pool_allocator = allocator
+        with get_parallel().override(dcp_kv_layout="page"):
+            info = TpModelWorker.get_worker_info(worker)
+        self.assertEqual(info[0], 128)
+        self.assertEqual(info[4], 127)
 
     def test_short_pool_warning_uses_served_capacity(self):
         # dcp1 serves 690K < 1M and warns; dcp2 widens the same rows to 1.38M.

@@ -325,11 +325,66 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
         seq_lens: torch.Tensor,
         seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,
+        rotation_bases: Optional[List[int]] = None,
     ):
-        raise NotImplementedError(
-            "PageInterleavePoolAllocator does not support decode allocation "
-            "(logical-page KV sharding runs on prefill nodes only)"
-        )
+        """Append one token per request, committing all owner-class draws together."""
+        if rotation_bases is None:
+            raise ValueError("Page-sharded decode requires per-request rotation bases")
+        counts, owners = self._decode_page_counts(seq_lens_cpu, rotation_bases)
+        if any(
+            need > free for need, free in zip(counts, self.class_free_page_counts())
+        ):
+            return None
+        if self.need_sort and any(
+            need > len(self.class_free_pages[r]) for r, need in enumerate(counts)
+        ):
+            self.merge_and_sort_free()
+
+        out = last_loc + 1
+        offsets = [0] * self.shard_size
+        for i, owner in enumerate(owners):
+            if owner is not None:
+                out[i] = self.class_free_pages[owner][offsets[owner]] * self.page_size
+                offsets[owner] += 1
+        for owner, count in enumerate(counts):
+            self.class_free_pages[owner] = self.class_free_pages[owner][count:]
+        return out
+
+    def _decode_page_counts(self, seq_lens_cpu, rotation_bases):
+        """New lengths include the appended token; a partial tail needs no page."""
+        assert len(seq_lens_cpu) == len(rotation_bases)
+        counts = [0] * self.shard_size
+        owners = []
+        for seq_len, base in zip(seq_lens_cpu, rotation_bases):
+            position = int(seq_len) - 1
+            assert position >= 0 and base is not None
+            owner = None
+            if position % self.page_size == 0:
+                owner = (base + position // self.page_size) % self.shard_size
+                counts[owner] += 1
+            owners.append(owner)
+        return counts, owners
+
+    def get_decode_allocation_demand(self, seq_lens_cpu, rotation_bases) -> int:
+        counts, _ = self._decode_page_counts(seq_lens_cpu, rotation_bases)
+        return self.shard_size * self.page_size * max(counts)
+
+    def check_decode_capacity(
+        self, *, num_tokens, tree_cache, requests=None, spec_algorithm=None
+    ) -> bool:
+        if requests is None:
+            demand = num_tokens * self.shard_size
+        else:
+            assert spec_algorithm is None or spec_algorithm.is_none()
+            bases = []
+            for req in requests:
+                base = tree_cache.rotation_base_of(req.last_node)
+                bases.append(req.kv_rotation_base if base is None else base)
+            demand = self.get_decode_allocation_demand(
+                [req.kv.kv_committed_len + 1 for req in requests], bases
+            )
+        self.evict_to_free_tokens(tree_cache, demand)
+        return self.available_size() >= demand
 
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:

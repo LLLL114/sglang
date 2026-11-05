@@ -66,10 +66,13 @@ class PageShardSpec(msgspec.Struct, frozen=True):
     page_size: int  # physical page size (kernel-visible)
     max_prefix_tokens: int  # scratch prefix-region capacity, granule-aligned
     chunk_tokens: int  # scratch chunk-region capacity, physical-page-aligned
+    gather_prefix: bool = True
 
     @property
     def scratch_rows(self) -> int:
         """Rows in each slot: assembled prefix, current batch chunk, trash page."""
+        if not self.gather_prefix:
+            return 0
         return self.max_prefix_tokens + self.chunk_tokens + self.page_size
 
     @property
@@ -125,6 +128,8 @@ def get_kv_shard_group(use_mla_backend: bool) -> GroupCoordinator:
       the returned trivial CP group has world_size 1, which disables
       sharding in get_kv_shard_group_info.
     """
+    if get_parallel().dcp_kv_layout == "page":
+        return get_parallel().dcp_group
     cp_group = get_parallel().attn_cp_group
     if cp_group.world_size > 1:
         return cp_group
@@ -168,7 +173,10 @@ def get_kv_shard_group_info(
         if pool is None:
             return None, 1
         return pool.shard_spec.shard_rank, pool.shard_spec.shard_size
-    if not get_parallel().enable_kv_cache_sharding:
+    if (
+        not get_parallel().enable_kv_cache_sharding
+        and get_parallel().dcp_kv_layout != "page"
+    ):
         return None, 1
     group = get_kv_shard_group(kvc.use_mla_backend)
     if group.world_size <= 1:
@@ -230,6 +238,15 @@ def make_page_shard_spec(kvc: KVCacheConfigurator) -> Optional[PageShardSpec]:
         return None
 
     page_size = kvc.page_size
+    if get_parallel().dcp_kv_layout == "page":
+        return PageShardSpec(
+            shard_rank=shard_rank,
+            shard_size=shard_size,
+            page_size=page_size,
+            max_prefix_tokens=0,
+            chunk_tokens=0,
+            gather_prefix=False,
+        )
     granule = shard_size * page_size
     return PageShardSpec(
         shard_rank=shard_rank,
@@ -255,7 +272,7 @@ def compute_page_shard_scratch_bytes(
     can opt into this estimate without changing the per-pool default.
     """
     spec = make_page_shard_spec(kvc)
-    if spec is None:
+    if spec is None or not spec.gather_prefix:
         return 0
     scratch_bytes = 2 * spec.scratch_rows * _page_shard_row_bytes(kvc)
     if include_mtp:

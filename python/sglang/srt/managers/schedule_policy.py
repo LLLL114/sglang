@@ -701,6 +701,11 @@ class PrefillAdder:
         self.kv_shard_scratch_spec = (
             self.token_to_kv_pool_allocator.shard_spec if kv_shard_size > 1 else None
         )
+        if (
+            self.kv_shard_scratch_spec is not None
+            and not self.kv_shard_scratch_spec.gather_prefix
+        ):
+            self.kv_shard_scratch_spec = None
         self.kv_shard_block_bound_pages = 0
         self.kv_shard_chunk_pages = 0
         # Reserve one extra page per shard class for allocation rounding.

@@ -548,9 +548,12 @@ class TpModelWorker(BaseTpWorker):
 
     def get_worker_info(self):
         # The runner already reports logical DCP capacity.
-        kv_capacity = (
-            self.model_runner.effective_logical_max_total_num_tokens
-            * page_interleave_shard_size(self.model_runner.token_to_kv_pool_allocator)
+        kv_capacity = self.model_runner.effective_logical_max_total_num_tokens * (
+            1
+            if get_parallel().dcp_kv_layout == "page"
+            else page_interleave_shard_size(
+                self.model_runner.token_to_kv_pool_allocator
+            )
         )
         if is_cp_sharded_padded():
             kv_capacity = from_cp_sharded(kv_capacity)

@@ -492,6 +492,12 @@ class Scheduler(
 
     # Logical-to-physical KV capacity ratio; defaults to 1 before pool init.
     kv_shard_widening: int = 1
+    _page_dcp: bool = False
+
+    @property
+    def kv_capacity_widening(self) -> int:
+        # DCP's worker capacity is already logical.
+        return 1 if self._page_dcp else self.kv_shard_widening
 
     # Class-level default so on_idle's stall gate works even if a fork
     # overrides init_load_publisher (which would otherwise not set it).
@@ -648,6 +654,7 @@ class Scheduler(
         self.kv_shard_widening = page_interleave_shard_size(
             self.token_to_kv_pool_allocator
         )
+        self._page_dcp = get_parallel().dcp_kv_layout == "page"
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
         if self.enable_hierarchical_cache:
@@ -2629,7 +2636,7 @@ class Scheduler(
         )
 
     def init_pool_stats_observer(self) -> None:
-        global_tokens = self.max_total_num_tokens * self.kv_shard_widening
+        global_tokens = self.max_total_num_tokens * self.kv_capacity_widening
         if is_cp_sharded_padded():
             global_tokens = from_cp_sharded(global_tokens)
         storage = kv_storage_of(
@@ -2721,7 +2728,7 @@ class Scheduler(
             maxlen=PAUSE_WINDOWS_MAX
         )
         self._pause_started_at: Optional[float] = None
-        global_tokens = self.max_total_num_tokens * self.kv_shard_widening
+        global_tokens = self.max_total_num_tokens * self.kv_capacity_widening
         if is_cp_sharded_padded():
             global_tokens = from_cp_sharded(global_tokens)
         self.load_inquirer = SchedulerLoadInquirer(
@@ -2879,7 +2886,7 @@ class Scheduler(
         # PrefillAdder reserves one page per shard; the allocator reserves one.
         # Subtract the other N - 1 pages to keep queue admission schedulable.
         token_capacity = (
-            self.max_total_num_tokens * self.kv_shard_widening
+            self.max_total_num_tokens * self.kv_capacity_widening
             - self.page_size * (self.kv_shard_widening - 1)
         )
         if is_cp_sharded_padded():

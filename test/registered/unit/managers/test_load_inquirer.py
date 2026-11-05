@@ -178,6 +178,7 @@ class TestSchedulerLoadInquirer(unittest.TestCase):
             server_args=None,
             max_total_num_tokens=1000,
             kv_shard_widening=1,
+            kv_capacity_widening=1,
             max_running_requests=10,
             pool_stats_observer=None,
             tp_worker=None,

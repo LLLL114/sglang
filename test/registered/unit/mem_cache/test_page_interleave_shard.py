@@ -181,6 +181,7 @@ class TestPageShardScratchSizing(CustomTestCase):
         group = SimpleNamespace(world_size=shard_size, rank_in_group=0)
         parallel = SimpleNamespace(
             enable_kv_cache_sharding=enabled,
+            dcp_kv_layout="token",
             attn_cp_group=(SimpleNamespace(world_size=1) if use_mla else group),
             attn_tp_group=group,
             attn_tp_size=tp_size,
@@ -708,6 +709,31 @@ def _alloc_extend(alloc, prefix_len, seq_len, rotation_base, last_loc=-1):
     )
 
 
+class TestPageDcpLocalPool(CustomTestCase):
+    def test_no_gather_resources_and_fresh_plan_for_reused_location_tensor(self):
+        spec = PageShardSpec(0, N, PS, 0, 0, gather_prefix=False)
+        pool = PageInterleaveKVPoolMixin()
+        pool.device = "cpu"
+        pool.page_size = PS
+        pool._init_page_shard_state(
+            spec, SimpleNamespace(world_size=N, rank_in_group=0)
+        )
+        self.assertEqual(spec.scratch_rows, 0)
+        self.assertFalse(hasattr(pool, "kv_gather_comm"))
+        self.assertFalse(hasattr(pool, "_slots"))
+        with torch.inference_mode():
+            loc = torch.tensor([N * PS, (N + 1) * PS])
+            pool.begin_local_forward(loc)
+            positions, rows = pool._get_write_plan(loc)
+            self.assertEqual(positions.tolist(), [0])
+            self.assertEqual(rows.tolist(), [PS])
+            loc.copy_(torch.tensor([(N + 1) * PS, 2 * N * PS]))
+            pool.begin_local_forward(loc)
+            positions, rows = pool._get_write_plan(loc)
+            self.assertEqual(positions.tolist(), [1])
+            self.assertEqual(rows.tolist(), [2 * PS])
+
+
 class TestClassedAllocator(CustomTestCase):
     def test_index_space_widened_classes_mirror_ranks(self):
         alloc = _make_allocator(pages_per_rank=32)
@@ -887,10 +913,66 @@ class TestClassedAllocator(CustomTestCase):
         alloc = _make_allocator()
         with self.assertRaises(NotImplementedError):
             alloc.alloc(GS)
-        with self.assertRaises(NotImplementedError):
+        with self.assertRaisesRegex(ValueError, "rotation bases"):
             alloc.alloc_decode(
                 torch.tensor([PS + 1]), torch.tensor([PS + 1]), torch.tensor([PS - 1])
             )
+
+    def test_decode_appends_across_owner_cycles_and_reuses_freed_pages(self):
+        for base in range(N):
+            with self.subTest(base=base):
+                alloc = _make_allocator(pages_per_rank=4)
+                slots = _alloc_extend(alloc, 0, PS - 1, base)
+                for length in range(PS, (N + 1) * PS + 2):
+                    before = alloc.class_free_page_counts()
+                    lens = torch.tensor([length])
+                    new = alloc.alloc_decode(lens, lens, slots[-1:], [base])
+                    self.assertIsNotNone(new)
+                    owner = (base + (length - 1) // PS) % N
+                    self.assertEqual(int(new[0] // PS % N), owner)
+                    expected = before.copy()
+                    if (length - 1) % PS == 0:
+                        expected[owner] -= 1
+                    else:
+                        self.assertEqual(int(new[0]), int(slots[-1]) + 1)
+                    self.assertEqual(alloc.class_free_page_counts(), expected)
+                    slots = torch.cat((slots, new))
+                self.assertEqual(len(slots.unique()), len(slots))
+                alloc.free(slots)
+                self.assertEqual(alloc.class_free_page_counts(), [4] * N)
+                alloc.debug_check_classes()
+
+    def test_decode_class_shortage_does_not_partially_allocate_batch(self):
+        alloc = _make_allocator(pages_per_rank=2)
+        # Two requests finish owner-0 pages; one owner-1 page is already used.
+        first = _alloc_extend(alloc, 0, PS, 0)
+        second = _alloc_extend(alloc, 0, PS, 0)
+        _alloc_extend(alloc, 0, PS, 1)
+        before = [x.clone() for x in alloc.class_free_pages]
+        lens = torch.tensor([PS + 1, PS + 1])
+        self.assertIsNone(
+            alloc.alloc_decode(lens, lens, torch.stack((first[-1], second[-1])), [0, 0])
+        )
+        for actual, expected in zip(alloc.class_free_pages, before):
+            self.assertTrue(torch.equal(actual, expected))
+
+    def test_decode_partial_tail_requires_no_free_pages(self):
+        alloc = _make_allocator(pages_per_rank=1)
+        slots = _alloc_extend(alloc, 0, N * PS - 1, 2)
+        self.assertEqual(alloc.available_size(), 0)
+        lens = torch.tensor([N * PS])
+        self.assertEqual(alloc.get_decode_allocation_demand(lens, [2]), 0)
+        new = alloc.alloc_decode(lens, lens, slots[-1:], [2])
+        self.assertEqual(int(new[0]), int(slots[-1]) + 1)
+
+    def test_decode_demand_reserves_for_concentrated_owner_draws(self):
+        alloc = _make_allocator()
+        self.assertEqual(
+            alloc.get_decode_allocation_demand([PS + 1] * 3, [0] * 3), 3 * GS
+        )
+        self.assertEqual(
+            alloc.get_decode_allocation_demand([PS + 1] * N, list(range(N))), GS
+        )
 
     def test_batch_alloc_per_request_rotation(self):
         """bs > 1: each request draws its own cyclic run; out_cache_loc is

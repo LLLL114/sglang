@@ -73,6 +73,65 @@ def create_triton_kv_indices_for_dcp_triton(
 
 
 # ---------------------------------------------------------------------------
+# Page-interleaved DCP: request positions to owner-local CSR indices.
+@triton.jit
+def page_dcp_kv_lens(
+    req_to_token,
+    req_ids,
+    seq_lens,
+    local_lens,
+    ROW_STRIDE: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    DCP_SIZE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
+):
+    request = tl.program_id(0)
+    row = tl.load(req_ids + request)
+    length = tl.load(seq_lens + request)
+    first_loc = tl.load(req_to_token + row * ROW_STRIDE, mask=length > 0, other=0)
+    base = first_loc // PAGE_SIZE % DCP_SIZE
+    phase = (DCP_RANK + DCP_SIZE - base) % DCP_SIZE
+    cycle = PAGE_SIZE * DCP_SIZE
+    local_length = length // cycle * PAGE_SIZE + tl.minimum(
+        tl.maximum(length % cycle - phase * PAGE_SIZE, 0), PAGE_SIZE
+    )
+    tl.store(local_lens + request, local_length)
+
+
+@triton.jit
+def page_dcp_kv_indices(
+    req_to_token,
+    req_ids,
+    local_lens,
+    indptr,
+    indices,
+    ROW_STRIDE: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    DCP_SIZE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
+):
+    request = tl.program_id(0)
+    row = tl.load(req_ids + request)
+    length = tl.load(local_lens + request)
+    first_loc = tl.load(req_to_token + row * ROW_STRIDE, mask=length > 0, other=0)
+    base = first_loc // PAGE_SIZE % DCP_SIZE
+    phase = (DCP_RANK + DCP_SIZE - base) % DCP_SIZE
+    start = tl.load(indptr + request)
+    BLOCK: tl.constexpr = 512
+    for block in range(tl.cdiv(length, BLOCK)):
+        local_pos = block * BLOCK + tl.arange(0, BLOCK)
+        valid = local_pos < length
+        position = (
+            local_pos // PAGE_SIZE * (PAGE_SIZE * DCP_SIZE)
+            + phase * PAGE_SIZE
+            + local_pos % PAGE_SIZE
+        )
+        loc = tl.load(req_to_token + row * ROW_STRIDE + position, mask=valid, other=0)
+        physical = loc // (PAGE_SIZE * DCP_SIZE) * PAGE_SIZE + loc % PAGE_SIZE
+        tl.store(indices + start + local_pos, physical, mask=valid)
+
+
+# ---------------------------------------------------------------------------
 # KV-index build (PR #14194, MLA): global prefix+extend layout for the
 # all-gathered dcp_kv_buffer, plus the per-rank shard/compact kernel.
 # ---------------------------------------------------------------------------

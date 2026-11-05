@@ -113,6 +113,19 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         self.assertLessEqual(req.sampling_params.min_new_tokens, max_new_tokens)
         return max_new_tokens
 
+    def test_page_dcp_capacity_is_logical_but_keeps_owner_reserve(self):
+        scheduler = self._new_scheduler(
+            max_req_len=5000,
+            max_total_num_tokens=1024,
+            page_size=64,
+            kv_shard_widening=2,
+        )
+        scheduler._page_dcp = True
+        scheduler.max_new_tokens_limit = None
+        req = self._new_req(max_new_tokens=None, input_len=64)
+        scheduler.init_req_max_new_tokens(req)
+        self.assertEqual(req.sampling_params.max_new_tokens, 831)
+
     def test_limit_disabled_by_default(self):
         with envs.SGLANG_MAX_NEW_TOKENS_LIMIT.override(None):
             scheduler = self._new_scheduler()

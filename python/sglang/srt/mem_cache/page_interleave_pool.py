@@ -204,6 +204,15 @@ class PageInterleaveKVPoolMixin:
         self.shard_size = spec.shard_size
         self.device_module = torch.get_device_module(self.device)
 
+        self._epoch = 0
+        self._shard_extend_active = False
+        self._write_plan_key = None
+        self._write_plan: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        if not spec.gather_prefix:
+            # DCP attends to owner-local KV and merges partial attention. It
+            # shares persistent placement with PCP, but needs no KV gather.
+            return
+
         # Check the pool's storage device before probing its NCCL shard group.
         self._use_symmetric_scratch = False
         if torch.device(self.device).type == "cuda":
@@ -247,8 +256,6 @@ class PageInterleaveKVPoolMixin:
                 device=self.device,
             )
 
-        self._epoch = 0
-        self._shard_extend_active = False
         self._block_pages = 0
         # Strictly larger than any local physical page id: the owner-major
         # sort key of logical page l is (l % N) * stride + l // N.
@@ -256,8 +263,6 @@ class PageInterleaveKVPoolMixin:
         self._debug_plan_checks = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
         self._send_pages: Optional[torch.Tensor] = None
         self._send_rows: Optional[torch.Tensor] = None
-        self._write_plan_key = None
-        self._write_plan: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         self._translate_cache: Dict[Tuple[int, int], torch.Tensor] = {}
 
         scratch_bytes = sum(
@@ -364,6 +369,7 @@ class PageInterleaveKVPoolMixin:
         are mirrored across ranks, so every rank derives the identical plan.
         """
         spec = self.shard_spec
+        assert spec.gather_prefix, "Local DCP reads do not assemble prefix scratch"
         ps, shard_size = spec.page_size, spec.shard_size
 
         # Per-request page samples. One logical page per position-page
@@ -578,6 +584,13 @@ class PageInterleaveKVPoolMixin:
 
     # ---- write plan (owner filter), cached per (loc tensor, epoch) --------------
 
+    def begin_local_forward(self, loc: torch.Tensor) -> None:
+        """Freeze owner-local writes once per eager DCP forward, across layers."""
+        assert not self.shard_spec.gather_prefix
+        self._epoch += 1
+        self._write_plan_key = None
+        self._get_write_plan(loc)
+
     def _get_write_plan(self, loc: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """(owned positions into ``loc``, their local physical rows).
 
@@ -597,13 +610,14 @@ class PageInterleaveKVPoolMixin:
 
 
 class PageInterleaveMHATokenToKVPool(PageInterleaveKVPoolMixin, MHATokenToKVPool):
-    """MHA/GQA pool striped across the attention CP group.
+    """MHA/GQA pool with whole-page ownership across a CP or DCP group.
 
     The write path relies on the prefill CP strategy materializing the full
     chunk's K/V before ``set_kv_buffer`` receives the full (unsplit)
     ``out_cache_loc`` on every rank. Each rank persists only its stripe and
     stages the full chunk into the current layer's scratch chunk region
-    (extend attention reads prefix *and* chunk through the scratch page table).
+    when ``gather_prefix`` is enabled. Eager DCP instead supplies replicated
+    K/V heads and reads only persistent local KV, with no scratch gather.
     """
 
     def __init__(
@@ -644,7 +658,9 @@ class PageInterleaveMHATokenToKVPool(PageInterleaveKVPoolMixin, MHATokenToKVPool
         layer_id_override: Optional[int] = None,
         dcp_kv_mask: Optional[torch.Tensor] = None,
     ):
-        assert dcp_kv_mask is None, "DCP is mutually exclusive with KV sharding"
+        assert dcp_kv_mask is None, (
+            "Page-sharded writes require unfiltered logical slots"
+        )
         loc, _, _ = unwrap_write_loc(loc_info)
         layer_id = (
             layer_id_override if layer_id_override is not None else layer.layer_id

@@ -685,6 +685,12 @@ Please consult the documentation below and [server_args.py](https://github.com/s
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
     </tr>
         <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--dcp-kv-layout`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>KV ownership across DCP ranks. Experimental <code>page</code> uses whole-page ownership for eager CUDA Triton dense Qwen3. See <a href="/docs/advanced_features/dcp#experimental-page-owned-gqa-kv">page-owned GQA KV</a> for requirements.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`token`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: str<br/>Choices: `token`, `page`</td>
+    </tr>
+        <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--dcp-comm-backend`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Communication backend for the DCP attention reduction: AllGather + ReduceScatter, one All-to-All exchange, or FlashInfer MNNVL All-to-All. Unset resolves to <code>fi_a2a</code> where the DCP group shares an MNNVL domain on Blackwell, else <code>a2a</code> on CUDA/ROCm/XPU, else <code>ag_rs</code>.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>

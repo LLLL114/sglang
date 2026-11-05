@@ -84,9 +84,97 @@ def validate_kv_shard_attention_backend(server_args: Any, cfg: Any = None) -> No
         raise ValueError("KV sharding with trtllm_mla requires chunked prefix caching.")
 
 
+def validate_page_dcp(server_args: Any, cfg: Any) -> None:
+    """Keep the initial page-DCP route on its tested eager GQA stack."""
+    import torch
+
+    model = model_config_of(server_args)
+    if (
+        cfg.device != "cuda"
+        or cfg.nnodes != 1
+        or cfg.pp_size != 1
+        or cfg.dp_size != 1
+        or cfg.attn_dp_size != 1
+        or cfg.attn_cp_size != 1
+        or cfg.dcp_size <= 1
+        or cfg.tp_size % cfg.dcp_size
+    ):
+        raise ValueError(
+            "Page DCP requires single-node CUDA TP, PP1/DP1 and DCP > 1 dividing TP."
+        )
+    if model.hf_config.architectures != ["Qwen3ForCausalLM"] or cfg.model_impl not in (
+        "auto",
+        "sglang",
+    ):
+        raise ValueError(
+            "Page DCP currently supports native dense Qwen3 GQA models only."
+        )
+    if attention_backends_of(resolved_view(server_args)) != ("triton", "triton"):
+        raise ValueError("Page DCP requires Triton prefill and decode attention.")
+    if model.dtype != torch.bfloat16 or cfg.kv_cache_dtype not in ("auto", "bf16"):
+        raise ValueError("Page DCP requires BF16 model and KV dtypes.")
+    if (
+        cfg.page_size != 64
+        or not cfg.chunked_prefill_size
+        or cfg.chunked_prefill_size <= 0
+    ):
+        raise ValueError("Page DCP requires --page-size 64 and chunked prefill.")
+    if cfg.chunked_prefill_size % cfg.page_size:
+        raise ValueError(
+            "Page DCP chunk size must be a multiple of the physical page size."
+        )
+    if cfg.disaggregation_mode != "null" or cfg.dcp_comm_backend != "ag_rs":
+        raise ValueError(
+            "Page DCP requires colocated serving and --dcp-comm-backend ag_rs."
+        )
+    if (
+        cfg.cuda_graph_config.prefill.backend != Backend.DISABLED
+        or cfg.cuda_graph_config.decode.backend != Backend.DISABLED
+        or not cfg.disable_overlap_schedule
+    ):
+        raise ValueError(
+            "Page DCP requires eager prefill/decode and --disable-overlap-schedule."
+        )
+    unsupported_flags = (
+        "enable_prefill_cp",
+        "cp_kv_layout",
+        "enable_kv_cache_sharding",
+        "enable_hierarchical_cache",
+        "enable_unified_memory",
+        "enable_hisparse",
+        "enable_lmcache",
+        "enable_flexkv",
+        "enable_unified_cache_external_linker",
+        "enable_lora",
+        "enable_mixed_chunk",
+        "enable_two_batch_overlap",
+        "enable_pd_role_switch",
+        "enable_streaming_session",
+        "enable_session_radix_cache",
+    )
+    for name in unsupported_flags:
+        if getattr(cfg, name):
+            raise ValueError(f"Page DCP does not support --{name.replace('_', '-')}.")
+    if cfg.speculative_algorithm is not None or cfg.dllm_algorithm is not None:
+        raise ValueError(
+            "Page DCP currently supports ordinary autoregressive decoding only."
+        )
+    if cfg.quantization is not None or cfg.radix_cache_backend is not None:
+        raise ValueError(
+            "Page DCP requires unquantized weights and the built-in radix cache."
+        )
+    if not envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.is_set():
+        envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.set("python")
+    if envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get() != "python":
+        raise ValueError("Page DCP requires the Python UnifiedTreeCore.")
+
+
 def handle_kv_cache_sharding(server_args: Any, gpu_mem: Optional[float] = None) -> None:
     """Validate KV sharding and declare its derived eager-prefill settings."""
     cfg = resolving_view(server_args)
+    if cfg.dcp_kv_layout == "page":
+        validate_page_dcp(server_args, cfg)
+        return
     if not cfg.enable_kv_cache_sharding:
         return
 

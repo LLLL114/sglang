@@ -6,6 +6,10 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 import triton
 
+from sglang.kernels.ops.attention.dcp_kernels import (
+    page_dcp_kv_indices,
+    page_dcp_kv_lens,
+)
 from sglang.kernels.ops.attention.metadata import get_num_kv_splits_triton
 from sglang.kernels.ops.attention.mla_kv_pack_quantize_fp8 import (
     mla_kv_pack_quantize_fp8,
@@ -148,6 +152,7 @@ class ForwardMetadata:
 
 
 class TritonAttnBackend(AttentionBackend):
+    _page_dcp: bool = False
     # CUDA-graph replay rebuilds metadata from preallocated kv_indptr/kv_indices
     # buffers; it never reads seq_lens_cpu / seq_lens_sum.
     needs_cpu_seq_lens: bool = False
@@ -265,6 +270,8 @@ class TritonAttnBackend(AttentionBackend):
         else:
             self.dcp_size = get_parallel().attn_dcp_size
             self.dcp_rank = get_parallel().attn_dcp_rank
+        self._page_dcp = get_parallel().dcp_kv_layout == "page"
+        self.needs_cpu_seq_lens = self._page_dcp
         self.num_head = (
             model_runner.model_config.get_max_num_attention_heads()
             // get_parallel().attn_tp_size
@@ -495,6 +502,40 @@ class TritonAttnBackend(AttentionBackend):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # Build per-DCP-rank sharded KV indptr/indices. eager passes kv_indices=None
         # (fresh tensor); cuda-graph passes an address-stable buffer to fill in place.
+        if self._page_dcp:
+            assert kv_indices is None and kv_start_idx is None
+            batch_size = len(req_pool_indices)
+            kv_indptr = kv_indptr[: batch_size + 1]
+            kv_indptr[0] = 0
+            local_lens = torch.empty_like(lens)
+            if batch_size:
+                page_dcp_kv_lens[(batch_size,)](
+                    self.req_to_token,
+                    req_pool_indices,
+                    lens,
+                    local_lens,
+                    self.req_to_token.stride(0),
+                    self.token_to_kv_pool.page_size,
+                    self.dcp_size,
+                    self.dcp_rank,
+                )
+                kv_indptr[1:] = torch.cumsum(local_lens, dim=0)
+            kv_indices = torch.empty(
+                int(local_lens.sum().item()), dtype=torch.int64, device=self.device
+            )
+            if batch_size:
+                page_dcp_kv_indices[(batch_size,)](
+                    self.req_to_token,
+                    req_pool_indices,
+                    local_lens,
+                    kv_indptr,
+                    kv_indices,
+                    self.req_to_token.stride(0),
+                    self.token_to_kv_pool.page_size,
+                    self.dcp_size,
+                    self.dcp_rank,
+                )
+            return kv_indptr, kv_indices, local_lens
         dcp_lens = self._dcp_lens(lens, kv_start_idx)
         kv_indptr[1 : len(req_pool_indices) + 1] = torch.cumsum(dcp_lens, dim=0)
         kv_indptr = kv_indptr[: len(req_pool_indices) + 1]
@@ -874,6 +915,8 @@ class TritonAttnBackend(AttentionBackend):
         if self.dllm_attention is not None:
             self.dllm_attention.graph_mode = False
         self._dense_one_shot_kv_indptr = None
+        if self._page_dcp:
+            self.token_to_kv_pool.begin_local_forward(forward_batch.out_cache_loc)
         bs = forward_batch.batch_size
         window_kv_indptr = self.window_kv_indptr
         window_kv_indices = None
@@ -894,7 +937,7 @@ class TritonAttnBackend(AttentionBackend):
                 if self.dcp_size > 1:
                     # DCP: per-rank sharded KV indices, else each rank reads the
                     # whole KV instead of its owner shard.
-                    kv_indptr, kv_indices, _ = self._dcp_kv_indices(
+                    kv_indptr, kv_indices, dcp_local_lens = self._dcp_kv_indices(
                         forward_batch.req_pool_indices,
                         forward_batch.seq_lens,
                         self.kv_indptr,
@@ -974,12 +1017,18 @@ class TritonAttnBackend(AttentionBackend):
             self.get_num_kv_splits(
                 num_kv_splits,
                 (
-                    self._dcp_lens(forward_batch.seq_lens).clamp_min(1)
+                    (
+                        dcp_local_lens
+                        if self._page_dcp
+                        else self._dcp_lens(forward_batch.seq_lens)
+                    ).clamp_min(1)
                     if self.dcp_size > 1
                     else forward_batch.seq_lens
                 ),
                 uneven_batch,
             )
+            if self._page_dcp:
+                self._page_dcp_empty_rows = dcp_local_lens == 0
 
             # Lean decode persistent-grid partial-result buffers.
             lean_Mp = torch.empty(
@@ -1640,10 +1689,9 @@ class TritonAttnBackend(AttentionBackend):
         k_scale=None,
         v_scale=None,
     ) -> None:
-        # DCP writes to the local physical shard (loc = out_cache_loc //
-        # dcp_size) through the masked path so each rank only stores the tokens
-        # it owns. Non-DCP keeps the original write loc and plain set_kv_buffer.
-        if self.dcp_size > 1:
+        # Token DCP masks and compacts writes here. Page DCP passes logical
+        # slots to the shared page pool, which applies its owner filter once.
+        if self.dcp_size > 1 and not self._page_dcp:
             # The rank-local slot of a physical loc is physical.
             loc = KVWriteLoc(
                 forward_batch.out_cache_loc // self.dcp_size,
@@ -2095,7 +2143,12 @@ class TritonAttnBackend(AttentionBackend):
                 skip_prefix=True,
             )
 
-        if kv_indices.numel() == 0:
+        has_prefix = (
+            any(forward_batch.extend_prefix_lens_cpu)
+            if self._page_dcp
+            else kv_indices.numel() > 0
+        )
+        if not has_prefix:
             return current_out.reshape(-1, layer.tp_q_head_num * layer.v_head_dim).to(
                 q.dtype
             )
@@ -2115,28 +2168,29 @@ class TritonAttnBackend(AttentionBackend):
             device=q.device,
             dtype=torch.float32,
         )
-        self.extend_attention_fwd(
-            q_all,
-            empty_k,
-            empty_v,
-            prefix_out,
-            k_buffer,
-            v_buffer,
-            self.forward_metadata.qo_indptr,
-            kv_indptr,
-            kv_indices,
-            None,
-            False,
-            None,
-            max_extend_len,
-            k_descale,
-            v_descale,
-            sm_scale=layer.scaling,
-            logit_cap=logits_soft_cap,
-            xai_temperature_len=layer.xai_temperature_len,
-            lse_extend=prefix_lse,
-            skip_extend=True,
-        )
+        if kv_indices.numel() > 0:
+            self.extend_attention_fwd(
+                q_all,
+                empty_k,
+                empty_v,
+                prefix_out,
+                k_buffer,
+                v_buffer,
+                self.forward_metadata.qo_indptr,
+                kv_indptr,
+                kv_indices,
+                None,
+                False,
+                None,
+                max_extend_len,
+                k_descale,
+                v_descale,
+                sm_scale=layer.scaling,
+                logit_cap=logits_soft_cap,
+                xai_temperature_len=layer.xai_temperature_len,
+                lse_extend=prefix_lse,
+                skip_extend=True,
+            )
 
         prefix_out, prefix_lse = cp_lse_ag_out_rs_mha(
             prefix_out, prefix_lse, group, return_lse=True
@@ -2407,7 +2461,11 @@ class TritonAttnBackend(AttentionBackend):
             get_is_capture_mode,
         )
 
-        if self.enable_deterministic or envs.SGLANG_DISABLE_LEAN_ATTENTION.get():
+        if (
+            self._page_dcp
+            or self.enable_deterministic
+            or envs.SGLANG_DISABLE_LEAN_ATTENTION.get()
+        ):
             enable_lean = False
         else:
             enable_lean = self.enable_lean_attention
@@ -2477,6 +2535,11 @@ class TritonAttnBackend(AttentionBackend):
                 ],
                 dim=-1,
             )
+            if self._page_dcp:
+                o_for_decode.masked_fill_(self._page_dcp_empty_rows[:, None, None], 0)
+                local_lse.masked_fill_(
+                    self._page_dcp_empty_rows[:, None], -float("inf")
+                )
             o = cp_lse_ag_out_rs_mha(o_for_decode, local_lse, group)
             return o.reshape(-1, layer.tp_q_head_num * layer.v_head_dim).to(q.dtype)
 
