@@ -30,6 +30,7 @@ from sglang.srt.layers.linear import QKVParallelLinear, ReplicatedParallelGroup
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, KVWriteLoc
+from sglang.srt.models.qwen3 import Qwen3Attention
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -248,6 +249,65 @@ class TestGetDcpLens(CustomTestCase):
         self.assertTrue(torch.equal(kernel_k[0], k[:, 0:1]))
         self.assertTrue(torch.equal(out, q))
 
+    def test_gqa_prefix_keeps_the_full_dcp_kv_head_shape(self):
+        group = SimpleNamespace(
+            world_size=2,
+            rank_in_group=1,
+            all_gather=lambda q, dim: torch.cat((q, q), dim=dim),
+        )
+        backend = TritonAttnBackend.__new__(TritonAttnBackend)
+        backend.forward_metadata = SimpleNamespace(
+            custom_mask=None,
+            kv_indptr=torch.tensor([0, 1]),
+            kv_indices=torch.tensor([1]),
+            max_extend_len=1,
+            qo_indptr=torch.tensor([0, 1]),
+        )
+        buffers = SimpleNamespace(
+            key=lambda: torch.zeros(4, 2, 2), value=lambda: torch.zeros(4, 2, 2)
+        )
+        backend.token_to_kv_pool = SimpleNamespace(
+            layer_router=SimpleNamespace(read=lambda _: buffers)
+        )
+        head_shapes = []
+
+        def kernel(q, k, v, out, *args, lse_extend, **kwargs):
+            head_shapes.append((q.shape[1], k.shape[1]))
+            out.zero_()
+            lse_extend.zero_()
+
+        backend.extend_attention_fwd = kernel
+        layer = SimpleNamespace(
+            sliding_window_size=-1,
+            tp_q_head_num=2,
+            tp_k_head_num=2,
+            qk_head_dim=2,
+            v_head_dim=2,
+            k_scale=None,
+            v_scale=None,
+            layer_id=0,
+            scaling=1.0,
+            xai_temperature_len=-1,
+        )
+        with (
+            rc.get_parallel().override(dcp_group=group),
+            patch(
+                "sglang.srt.layers.attention.triton_backend.cp_lse_ag_out_rs_mha",
+                side_effect=lambda out, lse, *args, **kwargs: (out[:, 2:], lse[:, 2:]),
+            ),
+        ):
+            backend._forward_extend_dcp(
+                q=torch.zeros(1, 2, 2),
+                k=torch.zeros(1, 2, 2),
+                v=torch.zeros(1, 2, 2),
+                layer=layer,
+                forward_batch=SimpleNamespace(),
+                causal=True,
+                logits_soft_cap=0.0,
+                sinks=None,
+            )
+        self.assertEqual(head_shapes, [(2, 1), (4, 2)])
+
     def test_triton_dcp_write_marks_the_rank_local_loc(self):
         """Each rank writes at `out_cache_loc // dcp_size` with the batch's
         physical mark, masked by position to the tokens it owns."""
@@ -416,6 +476,74 @@ class TestGetDcpLens(CustomTestCase):
             self.assertTrue(torch.equal(q, q_weight[tp_rank * 4 : (tp_rank + 1) * 4]))
             self.assertTrue(torch.equal(k, k_weight[kv_start : kv_start + 2]))
             self.assertTrue(torch.equal(v, v_weight[kv_start : kv_start + 2]))
+
+    def test_qwen3_attention_loads_the_dcp_groups_kv_heads(self):
+        hidden_size, head_dim, q_heads, kv_heads, tp_size = 64, 8, 8, 4, 4
+        q_weight = torch.arange(
+            q_heads * head_dim * hidden_size, dtype=torch.float32
+        ).view(-1, hidden_size)
+        k_weight = (
+            torch.arange(kv_heads * head_dim * hidden_size, dtype=torch.float32).view(
+                -1, hidden_size
+            )
+            + 10000
+        )
+        v_weight = k_weight + 10000
+        for dcp_size in (1, 2, 4):
+            for rank in range(tp_size):
+                group = SimpleNamespace(rank_in_group=rank, world_size=tp_size)
+                with (
+                    rc.get_parallel().override(
+                        tp_group=group,
+                        attn_tp_group=group,
+                        tp_size=tp_size,
+                        tp_rank=rank,
+                        attn_tp_rank=rank,
+                        **rc.derive_parallel_widths(
+                            tp_size=tp_size,
+                            attn_cp_size=1,
+                            attn_dp_size=1,
+                            moe_ep_size=1,
+                            moe_dp_size=1,
+                            dcp_size=dcp_size,
+                            dcp_enabled=dcp_size > 1,
+                        ),
+                    ),
+                    patch(
+                        "sglang.srt.models.qwen3.get_exec",
+                        return_value=SimpleNamespace(
+                            deterministic=SimpleNamespace(rl_on_policy_target=None),
+                            kernel=SimpleNamespace(enable_fused_qk_norm_rope=False),
+                        ),
+                    ),
+                ):
+                    layer = Qwen3Attention(
+                        hidden_size,
+                        q_heads,
+                        kv_heads,
+                        head_dim=head_dim,
+                        max_position_embeddings=16,
+                        rms_norm_eps=1e-6,
+                    )
+                projection = layer.qkv_proj
+                for name, weight in (("q", q_weight), ("k", k_weight), ("v", v_weight)):
+                    projection.weight_loader(projection.weight, weight, name)
+                self.assertEqual(layer.num_kv_heads, dcp_size)
+                self.assertEqual(layer.attn.tp_k_head_num, dcp_size)
+                q, k, v = projection.weight.split(
+                    [layer.q_size, layer.kv_size, layer.kv_size]
+                )
+                q_start = rank * layer.q_size
+                kv_start = rank // dcp_size * layer.kv_size
+                self.assertTrue(
+                    torch.equal(q, q_weight[q_start : q_start + layer.q_size])
+                )
+                self.assertTrue(
+                    torch.equal(k, k_weight[kv_start : kv_start + layer.kv_size])
+                )
+                self.assertTrue(
+                    torch.equal(v, v_weight[kv_start : kv_start + layer.kv_size])
+                )
 
     def test_configurator_scales_only_the_virtual_dcp_allocator(self):
         physical_kv_size = 1024

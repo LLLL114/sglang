@@ -2041,6 +2041,11 @@ class TritonAttnBackend(AttentionBackend):
         k_buffer = self.kv_layers.read(layer.layer_id).key()
         v_buffer = self.kv_layers.read(layer.layer_id).value()
 
+        # The prefix kernel derives its GQA ratio from these empty tensors.
+        # Keep the DCP group's KV head count before slicing the current chunk
+        # down to the heads used by this rank's local queries.
+        empty_k = k[:0].contiguous()
+        empty_v = v[:0].contiguous()
         current_out = torch.zeros(
             (total_tokens, local_heads, layer.v_head_dim),
             device=q.device,
@@ -2110,8 +2115,6 @@ class TritonAttnBackend(AttentionBackend):
             device=q.device,
             dtype=torch.float32,
         )
-        empty_k = k[:0].contiguous()
-        empty_v = v[:0].contiguous()
         self.extend_attention_fwd(
             q_all,
             empty_k,
