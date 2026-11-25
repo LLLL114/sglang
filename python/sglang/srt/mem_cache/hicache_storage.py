@@ -7,7 +7,7 @@ import threading
 import time
 import uuid
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Iterable, List, Optional, Sequence, Set
 
@@ -55,6 +55,8 @@ class HiCacheStorageConfig:
     # Whole-page replication can differ from the target's attention layout.
     rank_replicated: Optional[bool] = None
     kv_reshard_metadata: dict | None = None
+    # Resolved by the Gather upload planner during attachment, before backup starts.
+    kv_reshard_writer: bool | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self):
         if self.dcp_size < 1 or not 0 <= self.dcp_rank < self.dcp_size:
@@ -86,11 +88,14 @@ class HiCacheStorageConfig:
     def is_storage_writer(self) -> bool:
         """Select one writer for each shared storage object.
 
-        Unified full-page CP replicas share keys and use CP rank 0. Legacy
+        Gather uses the canonical writer selected for the local KV head shard.
+        For other storage paths, unified full-page CP replicas use CP rank 0. Legacy
         keys include the CP rank, so every CP copy retains its own writer.
         MLA uses one writer per DCP shard in the first DCP group; with DCP
         disabled, MLA uses TP rank 0 and non-MLA uses every TP rank.
         """
+        if self.kv_reshard_writer is not None:
+            return self.kv_reshard_writer
         if self.unified_suffixes is not None and self.attn_cp_rank != 0:
             return False
         return not self.is_rank_replicated or self.tp_rank == self.dcp_rank

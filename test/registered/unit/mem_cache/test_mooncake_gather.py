@@ -60,17 +60,17 @@ def config():
     )
 
 
-def collect(ctrl, cfg):
+def collect(ctrl, cfg, total_kv_heads=4):
     model = SimpleNamespace(
         is_multimodal=False,
         num_hidden_layers=5,
-        get_total_num_kv_heads=lambda: 4,
+        get_total_num_kv_heads=lambda: total_kv_heads,
         hf_config=SimpleNamespace(to_dict=lambda: {"layers": 5}),
     )
 
     def gather(output, parts, group):
         if group == "tp":
-            for t in range(2):
+            for t in range(cfg.tp_size):
                 output[t] = [dict(parts[0], tp=t, writer_instance=f"tp-{t}")]
         else:
             for pp, layers in enumerate(([0, 1, 2], [3, 4])):
@@ -90,7 +90,10 @@ def collect(ctrl, cfg):
             return_value=SimpleNamespace(dp_size=1, enable_lora=False),
         ),
         patch("sglang.srt.runtime_context.process_model_config", return_value=model),
-        patch("torch.distributed.get_world_size", return_value=2),
+        patch(
+            "torch.distributed.get_world_size",
+            side_effect=lambda group: cfg.tp_size if group == "tp" else cfg.pp_size,
+        ),
         patch("torch.distributed.all_gather_object", side_effect=gather),
     ):
         return collect_reshard_metadata(ctrl, cfg)
@@ -558,6 +561,130 @@ class TestGatherStore(unittest.TestCase):
         }
         raw.get_into_ranges_from_snapshot.side_effect = get
         return raw, objects
+
+    def test_replicated_kv_backup_and_cross_topology_restore(self):
+        from queue import Queue
+        from threading import Event
+
+        from sglang.srt.managers.cache_controller import HiCacheController
+        from sglang.srt.mem_cache.pool_host.page_unified import PageUnifiedLayout
+
+        def attach(raw, tp, heads, layout):
+            ranks = []
+            for rank in range(tp):
+                local_heads = max(1, heads // tp)
+                host = pool(layers=5, heads=local_heads)
+                if layout == "page_unified":
+                    host.layout = layout
+                    host.page_unified_layout = PageUnifiedLayout(
+                        page_size=4,
+                        layer_num=5,
+                        head_num=local_heads,
+                        head_group_num=1,
+                        head_dim=8,
+                        itemsize=2,
+                    )
+                    host.kv_buffer = torch.zeros(
+                        host.page_unified_layout.page_dims(4), dtype=host.dtype
+                    )
+                cfg = config()
+                cfg.tp_rank, cfg.tp_size, cfg.pp_size = rank, tp, 1
+                ctrl = SimpleNamespace(
+                    storage_host_pool=host,
+                    mem_pool_host=host,
+                    tp_group="tp",
+                    pp_group=None,
+                )
+                cfg.kv_reshard_metadata = collect(ctrl, cfg, total_kv_heads=heads)
+                manager = ReshardManager(raw, host, cfg)
+                self.addCleanup(manager.close)
+                cc = HiCacheController.__new__(HiCacheController)
+                cc.storage_config = cfg
+                cc.page_size = host.page_size
+                cc.backup_queue, cc.ack_backup_queue = Queue(), Queue()
+                cc.storage_stop_event = Event()
+                cc.page_set_func = Mock(
+                    side_effect=lambda keys, indices, info, m=manager: all(
+                        m.batch_set_v1(keys, indices)
+                    )
+                )
+                self.assertEqual(cc.backup_skip, rank % max(1, tp // heads) != 0)
+                self.assertTrue(
+                    all(
+                        (c.writer is None) == cc.backup_skip for c in manager.components
+                    )
+                )
+                ranks.append((cc, manager, host))
+            return ranks
+
+        def backup(ranks, key, slot):
+            indices = torch.arange(slot * 4, slot * 4 + 4)
+            with ThreadPoolExecutor(len(ranks)) as threads:
+                ops = []
+                try:
+                    for cc, _, _ in ranks:
+                        op = SimpleNamespace(
+                            hash_value=[key],
+                            host_indices=indices,
+                            prefix_keys=None,
+                            completed_tokens=0,
+                        )
+                        cc.backup_queue.put(op)
+                        ops.append((cc, op, threads.submit(cc.backup_thread_func)))
+                    for cc, op, _ in ops:
+                        self.assertIs(cc.ack_backup_queue.get(timeout=15), op)
+                        self.assertEqual(
+                            op.completed_tokens, 0 if cc.backup_skip else 4
+                        )
+                        self.assertEqual(
+                            cc.page_set_func.call_count, int(not cc.backup_skip)
+                        )
+                finally:
+                    for cc, _, _ in ops:
+                        cc.storage_stop_event.set()
+                        cc.backup_queue.put(None)
+                for _, _, job in ops:
+                    job.result()
+
+        def page(host, slot):
+            # A [K/V, token, layer, head, dim] view of the requested physical slot.
+            if host.layout == "page_unified":
+                return host.kv_buffer[slot, 0].permute(1, 2, 0, 3, 4)
+            return host.kv_buffer[:, slot * 4 : (slot + 1) * 4]
+
+        def restore(manager, key):
+            args = manager.prepare_read([key], torch.arange(4, 8))
+            self.assertTrue(all(n > 0 for n in manager.batch_get_into(*args)))
+
+        for tp, heads in ((2, 1), (4, 2)):
+            for layout in ("page_first", "page_unified"):
+                with self.subTest(tp=tp, heads=heads, layout=layout):
+                    raw, objects = self.memory_store()
+                    replicated = attach(raw, tp, heads, layout)
+                    single = attach(raw, 1, heads, layout)
+                    expected = torch.arange(
+                        2 * 4 * 5 * heads * 8, dtype=torch.float16
+                    ).view(2, 4, 5, heads, 8)
+                    for rank, (cc, _, host) in enumerate(replicated):
+                        head = rank // (tp // heads)
+                        page(host, 0).copy_(expected[:, :, :, head : head + 1])
+                        if cc.backup_skip:
+                            page(host, 0).fill_(-1)
+                    backup(replicated, "from-tp", 0)
+                    _, reader, host = single[0]
+                    self.assertEqual(set(objects), set(reader.object_keys(["from-tp"])))
+
+                    restore(reader, "from-tp")
+                    self.assertTrue(torch.equal(page(host, 1), expected))
+                    backup(single, "from-one", 1)
+                    for rank, (_, manager, local) in enumerate(replicated):
+                        restore(manager, "from-one")
+                        head = rank // (tp // heads)
+                        self.assertTrue(
+                            torch.equal(
+                                page(local, 1), expected[:, :, :, head : head + 1]
+                            )
+                        )
 
     def test_unified_gather_restores_both_planes_with_different_head_groups(self):
         from contextlib import nullcontext

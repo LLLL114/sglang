@@ -293,8 +293,6 @@ class _ComponentIO:
         from .rank_gather import RankGatherWriter
 
         writers = upload_plan.part_writers
-        if len(writers) != len(self.placement.parts) and self._component != "latent":
-            raise ValueError("unsupported replicated writer for this resource")
         self.writer = None
         if self.participant in writers:
             self.writer = RankGatherWriter(
@@ -500,7 +498,7 @@ class _ComponentIO:
 
     def upload(self, physical, slots, page_meta):
         if self.writer is None:
-            raise ValueError("only canonical latent replicas publish")
+            raise ValueError("only canonical Gather writers publish")
         if self._write_spans is not None:
             return self.writer.upload_slots(
                 physical, slots, self._write_spans, self._slot_stride
@@ -550,7 +548,10 @@ class ReshardManager:
             )
 
             page_meta = None
-            needs_meta = any(c._component in ("key", "value") for c in self.components)
+            needs_meta = any(
+                c.writer is not None and c._component in ("key", "value")
+                for c in self.components
+            )
             getter = pool.get_page_buffer_meta if needs_meta else None
             # Custom getters may use a non-affine mapping. Keep their per-batch lookup.
             affine = getattr(getter, "__func__", None) in (
@@ -580,6 +581,8 @@ class ReshardManager:
             if store.register_buffer(ptr, len(self._scratch)) != 0:
                 raise RuntimeError("failed to register GatherPageReader scratch")
             self._scratch_ptr = ptr
+            # K and V share rank ownership. Every replica keeps its own read binding.
+            config.kv_reshard_writer = self.components[0].writer is not None
         except BaseException:
             self.close()
             raise
