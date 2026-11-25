@@ -248,8 +248,8 @@ class _ComponentIO:
     def __init__(self, native_store, pool, config, component):
         from mooncake.reshard.contracts import ParticipantId
         from mooncake.reshard.kv_cache import (
-            StoreReadTarget,
             KVCacheStoreManifest,
+            StoreReadTarget,
             plan_kv_cache_store_upload,
         )
 
@@ -286,13 +286,12 @@ class _ComponentIO:
                 STORAGE_BATCH_SIZE,
             )
         self._pool_signature = self._current_pool_signature()
-        paged = pool.layout in ("page_first_direct", "page_head")
-        self._slot_unit = pool.page_size if paged else 1
         slot_axis = 1 if pool.layout == "layer_first" else 0
         tensor = self._tensor
         self._slot_stride = tensor.stride(slot_axis) * tensor.element_size()
         binding = self._page_binding()
         (self._read_region,) = binding.regions
+        self._write_spans = None
         self.target = StoreReadTarget(self.placement, binding, manifest.model_domain)
         format_tag = {"key": "rsrg4_k", "value": "rsrg4_v", "latent": "rsrg2"}[
             component
@@ -392,78 +391,72 @@ class _ComponentIO:
             t.dtype,
         )
 
-    def _page_slots(self, keys, indices):
+    def validate_binding(self):
         if self._current_pool_signature() != self._pool_signature:
             raise ValueError(
                 "KV Store pool changed; reattach the backend before transfer"
             )
-        page_size = self.pool.page_size
-        if indices.ndim != 1 or indices.dtype not in (torch.int32, torch.int64):
-            raise ValueError("HiCache indices must be a one-dimensional integer tensor")
-        if indices.numel() != len(keys) * page_size:
-            raise ValueError("transfer keys and host indices differ")
-        tokens = indices.tolist()
-        slots = tokens[::page_size]
-        for page, slot in enumerate(slots):
-            if slot < 0 or slot + page_size > self.pool.size:
-                raise ValueError("HiCache page outside host pool")
-            if slot % page_size or tokens[
-                page * page_size : (page + 1) * page_size
-            ] != list(range(slot, slot + page_size)):
-                raise ValueError("HiCache page slots must be aligned and contiguous")
-        return slots
 
-    def upload(self, physical, indices):
+    def bind_write_page(self, page_meta, last_slot):
+        """Bind page-zero spans once; the pool signature guards later translations."""
+        if self.writer is None:
+            return
+        if self._component == "latent":
+            page = self._tensor[0]
+            blocks = (page,) if page.is_contiguous() else page.unbind(0)
+            if not all(block.is_contiguous() for block in blocks):
+                raise ValueError("noncontiguous resource layer payload")
+            spans = tuple((block.data_ptr(), block.nbytes) for block in blocks)
+        elif page_meta is not None:
+            pointers, sizes = self._component_buffers(1, page_meta)
+            spans = tuple(zip(pointers[0], sizes[0], strict=True))
+        else:
+            return
+        self._validate_write_spans(spans, last_slot * self._slot_stride)
+        self._write_spans = spans
+
+    def _validate_write_spans(self, spans, last_delta=0):
+        region = self._read_region
+        end = region.address + region.nbytes
+        for address, size in spans:
+            if size < 0 or (
+                size and (address < region.address or address + last_delta + size > end)
+            ):
+                raise ValueError("source page spans exceed the bound host region")
+
+    def _component_buffers(self, count, page_meta):
+        pointers, sizes = page_meta
+        width = 2 * self.pool.layer_num if self.pool.layout == "layer_first" else 2
+        if len(pointers) != width * count or len(sizes) != len(pointers):
+            raise ValueError("HiCache page buffers differ from gather payload coverage")
+        plane = int(self._component == "value")
+
+        def rows(values):
+            result = []
+            for i in range(0, len(values), width):
+                row = []
+                for v in values[i + plane : i + width : 2]:
+                    row.extend(v if isinstance(v, (list, tuple)) else (v,))
+                result.append(row)
+            return result
+
+        return rows(pointers), rows(sizes)
+
+    def upload(self, physical, slots, page_meta):
         if self.writer is None:
             raise ValueError("only canonical latent replicas publish")
-        slots = self._page_slots(physical, indices)
-        if self._component == "latent":
-            tensor = self._tensor
-            if self.pool.layout != "page_first_direct":
-                raise ValueError("single resource requires page_first_direct")
-            pages = slots
-            src = []
-            lengths = []
-            for slot in pages:
-                blocks = tensor[slot // self.pool.page_size]
-                if blocks.is_contiguous():
-                    blocks = [blocks]
-                else:
-                    blocks = blocks.unbind(0)
-                if not all(b.is_contiguous() for b in blocks):
-                    raise ValueError("noncontiguous resource layer payload")
-                src.append([b.data_ptr() for b in blocks])
-                lengths.append([b.numel() * b.element_size() for b in blocks])
-            return self.writer.upload(physical, src, lengths)
-        pointers, sizes = self.pool.get_page_buffer_meta(indices)
-        # Base MHA pools return alternating K/V spans, one pair per layer for
-        # layer_first and one pair per page for the other layouts.
-        width = 2 * self.pool.layer_num if self.pool.layout == "layer_first" else 2
-        if len(pointers) != width * len(physical) or len(sizes) != len(pointers):
-            raise ValueError("HiCache page buffers differ from gather payload coverage")
+        if self._write_spans is not None:
+            return self.writer.upload_slots(
+                physical, slots, self._write_spans, self._slot_stride
+            )
+        pointers, sizes = self._component_buffers(len(physical), page_meta)
+        for row, lengths in zip(pointers, sizes, strict=True):
+            self._validate_write_spans(zip(row, lengths, strict=True))
+        return self.writer.upload(physical, pointers, sizes)
 
-        def pages(values):
-            rows = []
-            for start in range(0, len(values), width):
-                spans = values[start : start + width]
-                ordered = spans[int(self._component == "value") :: 2]
-                row = []
-                for span in ordered:
-                    if isinstance(span, (list, tuple)):
-                        row.extend(span)
-                    else:
-                        row.append(span)
-                rows.append(row)
-            return rows
-
-        return self.writer.upload(physical, pages(pointers), pages(sizes))
-
-    def read_buffers(self, keys, indices):
+    def read_buffers(self, slots):
         region = self._read_region
-        offsets = [
-            (slot // self._slot_unit) * self._slot_stride
-            for slot in self._page_slots(keys, indices)
-        ]
+        offsets = [slot * self._slot_stride for slot in slots]
         return [(region.address + delta, region.nbytes - delta) for delta in offsets]
 
 
@@ -482,17 +475,46 @@ class ReshardManager:
             if config.kv_reshard_metadata.get("component") == "latent"
             else ("key", "value")
         )
-        from mooncake.reshard.kv_cache import GATHER_HEADER_BYTES
         from sglang.srt.mem_cache.hicache_storage import STORAGE_BATCH_SIZE
 
+        self.pool = pool
+        paged = pool.layout in ("page_first_direct", "page_head")
+        self._slot_unit = pool.page_size if paged else 1
         self._store = store
         self._scratch_ptr = None
         self.components = []
         try:
             for name in names:
                 self.components.append(_ComponentIO(store, pool, config, name))
+            from sglang.srt.mem_cache.pool_host.mha import (
+                AsymmetricMHATokenToKVPoolHost,
+                MHATokenToKVPoolHost,
+            )
+
+            page_meta = None
+            needs_meta = any(c._component != "latent" for c in self.components)
+            getter = pool.get_page_buffer_meta if needs_meta else None
+            # Custom getters may use a non-affine mapping. Keep their per-batch lookup.
+            affine = getattr(getter, "__func__", None) in (
+                MHATokenToKVPoolHost.get_page_buffer_meta,
+                AsymmetricMHATokenToKVPoolHost.get_page_buffer_meta,
+            )
+            affine = affine and all(c._tensor.is_contiguous() for c in self.components)
+            self._needs_batch_write_meta = needs_meta and not affine
+            if affine:
+                page_meta = getter(torch.arange(pool.page_size, device="cpu"))
+            last_slot = (pool.size - pool.page_size) // self._slot_unit
+            for component in self.components:
+                component.bind_write_page(page_meta, last_slot)
             first, *others = [c.target for c in self.components]
-            self._scratch = bytearray(STORAGE_BATCH_SIZE * (GATHER_HEADER_BYTES + 32))
+            size_for = getattr(reader_type, "scratch_bytes", None)
+            if size_for is None:
+                from mooncake.reshard.kv_cache import GATHER_HEADER_BYTES
+
+                scratch_bytes = STORAGE_BATCH_SIZE * (GATHER_HEADER_BYTES + 32)
+            else:
+                scratch_bytes = size_for(STORAGE_BATCH_SIZE)
+            self._scratch = bytearray(scratch_bytes)
             self.reader = reader_type(
                 store, *first, self._scratch, additional_targets=others
             )
@@ -514,25 +536,78 @@ class ReshardManager:
             for k in page
         ]
 
+    def _page_slots(self, keys, indices):
+        for component in self.components:
+            component.validate_binding()
+        page_size = self.pool.page_size
+        if indices.ndim != 1 or indices.dtype not in (torch.int32, torch.int64):
+            raise ValueError("HiCache indices must be a one-dimensional integer tensor")
+        if indices.numel() != len(keys) * page_size:
+            raise ValueError("transfer keys and host indices differ")
+        tokens = indices.tolist()
+        slots = tokens[::page_size]
+        for page, slot in enumerate(slots):
+            if slot < 0 or slot + page_size > self.pool.size:
+                raise ValueError("HiCache page outside host pool")
+            if slot % page_size or tokens[
+                page * page_size : (page + 1) * page_size
+            ] != list(range(slot, slot + page_size)):
+                raise ValueError("HiCache page slots must be aligned and contiguous")
+        return [slot // self._slot_unit for slot in slots]
+
     def prepare_read(self, keys, host_indices):
         """Prepare v1 vectors in component order: all K pages, then all V pages."""
+        slots = self._page_slots(keys, host_indices)
         key_strs, ptrs, sizes = [], [], []
         for c in self.components:
             key_strs.extend(c.object_keys(keys))
-            for ptr, size in c.read_buffers(keys, host_indices):
+            for ptr, size in c.read_buffers(slots):
                 ptrs.append(ptr)
                 sizes.append(size)
         return key_strs, ptrs, sizes
 
+    def batch_get_into(self, key_strs, buffer_ptrs, buffer_sizes):
+        """Read the component batches from prepare_read and return page-major results."""
+        pages, remainder = divmod(len(key_strs), len(self.components))
+        if (
+            remainder
+            or len(buffer_ptrs) != len(key_strs)
+            or len(buffer_sizes) != len(key_strs)
+        ):
+            raise ValueError("invalid Gather read batch dimensions")
+        # prepare_read lays out one contiguous batch per component.
+        groups = []
+        for i, component in enumerate(self.components):
+            batch = slice(i * pages, (i + 1) * pages)
+            codes = self.reader.batch_get_into(
+                key_strs[batch],
+                buffer_ptrs[batch],
+                buffer_sizes[batch],
+                target_manifest=component.placement,
+            )
+            if len(codes) != pages:
+                raise ValueError("unexpected Gather read result length")
+            groups.append(codes)
+        if len(groups) == 1:
+            return groups[0]
+        # Match the physical result order expected by _batch_postprocess.
+        return [code for page in zip(*groups, strict=True) for code in page]
+
     def batch_set_v1(self, keys, host_indices):
+        slots = self._page_slots(keys, host_indices)
+        page_meta = None
+        if self._needs_batch_write_meta:
+            page_meta = self.pool.get_page_buffer_meta(host_indices)
         per_component = [
-            c.upload(c.object_keys(keys), host_indices) for c in self.components
+            c.upload(c.object_keys(keys), slots, page_meta) for c in self.components
         ]
         return [
             all(code == 0 for code in page) for page in zip(*per_component, strict=True)
         ]
 
     def close(self):
+        if close_reader := getattr(getattr(self, "reader", None), "close", None):
+            close_reader()
         for c in self.components:
             c.close()
         if self._scratch_ptr is not None:

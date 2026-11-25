@@ -1864,30 +1864,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         reshard=None,
     ) -> List[int]:
         if reshard is not None:
-            pages, remainder = divmod(len(key_strs), len(reshard.components))
-            if (
-                remainder
-                or len(buffer_ptrs) != len(key_strs)
-                or len(buffer_sizes) != len(key_strs)
-            ):
-                raise ValueError("invalid Gather read batch dimensions")
-            # prepare_read lays out one contiguous batch per component.
-            groups = []
-            for i, component in enumerate(reshard.components):
-                batch = slice(i * pages, (i + 1) * pages)
-                codes = reshard.reader.batch_get_into(
-                    key_strs[batch],
-                    buffer_ptrs[batch],
-                    buffer_sizes[batch],
-                    target_manifest=component.placement,
-                )
-                if len(codes) != pages:
-                    raise ValueError("unexpected Gather read result length")
-                groups.append(codes)
-            if len(groups) == 1:
-                return groups[0]
-            # Match the physical result order expected by _batch_postprocess.
-            return [code for page in zip(*groups, strict=True) for code in page]
+            return reshard.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
         if self._uses_multi_buffer(buffer_ptrs):
             return self.store.batch_get_into_multi_buffers(
                 key_strs, buffer_ptrs, buffer_sizes

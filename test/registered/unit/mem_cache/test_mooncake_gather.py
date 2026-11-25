@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
+
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.storage.mooncake_store.reshard_adapter import (
@@ -136,8 +137,9 @@ class TestGatherStore(unittest.TestCase):
         with self.assertRaises(ValueError):
             collect(ctrl, cfg)
 
-    def adapter(self, layout="page_first", settings=None):
-        host = pool(layout=layout)
+    def adapter(self, layout="page_first", settings=None, host=None):
+        if host is None:
+            host = pool(layout=layout)
         cfg = config()
         cfg.extra_config["kv_reshard"].update(settings or {})
         cfg.kv_reshard_metadata = collect(
@@ -152,6 +154,25 @@ class TestGatherStore(unittest.TestCase):
         adapter = ReshardManager(raw, host, cfg)
         self.addCleanup(adapter.close)
         return adapter, host, raw
+
+    def test_reader_supplies_registration_size_with_legacy_fallback(self):
+        from mooncake.reshard.kv_cache import GATHER_HEADER_BYTES
+
+        from sglang.srt.mem_cache.hicache_storage import STORAGE_BATCH_SIZE
+
+        reader = get_reshard_reader_type()
+        with patch.object(
+            reader, "scratch_bytes", return_value=8192, create=True
+        ) as size:
+            manager, _, store = self.adapter()
+            size.assert_called_once_with(STORAGE_BATCH_SIZE)
+            self.assertEqual(len(manager._scratch), 8192)
+            store.register_buffer.assert_any_call(manager._scratch_ptr, 8192)
+        with patch.object(reader, "scratch_bytes", None, create=True):
+            manager, _, store = self.adapter()
+            expected = STORAGE_BATCH_SIZE * (GATHER_HEADER_BYTES + 32)
+            self.assertEqual(len(manager._scratch), expected)
+            store.register_buffer.assert_any_call(manager._scratch_ptr, expected)
 
     def test_rank_gather_publishes_one_object_in_rank_order(self):
         self.check_rank_gather_publishes_one_object(False)
@@ -396,8 +417,18 @@ class TestGatherStore(unittest.TestCase):
                     [torch.arange(s, s + host.page_size) for s in slots]
                 )
                 keys = ("a", "b")
-                for c in adapter.components:
-                    buffers = c.read_buffers(keys, indices)
+                local_slots = adapter._page_slots(keys, indices)
+                pointers, lengths = host.get_page_buffer_meta(indices)
+                for plane, c in enumerate(adapter.components):
+                    translated = [
+                        (address + slot * c._slot_stride, length)
+                        for slot in local_slots
+                        for address, length in c._write_spans
+                    ]
+                    self.assertEqual(
+                        translated, list(zip(pointers[plane::2], lengths[plane::2]))
+                    )
+                    buffers = c.read_buffers(local_slots)
                     binding = c._page_binding()
                     regions = {r.region_id: r for r in binding.regions}
                     for slot, (ptr, capacity) in zip(slots, buffers):
@@ -435,6 +466,62 @@ class TestGatherStore(unittest.TestCase):
                                         address + delta[span.region_id],
                                         tensor[idx].data_ptr(),
                                     )
+
+    def test_shares_slot_calculation_and_reuses_bound_writer_spans(self):
+        manager, host, _ = self.adapter()
+        keys = ["a", "b"]
+        indices = torch.tensor([8, 9, 10, 11, 0, 1, 2, 3])
+        with (
+            patch.object(manager, "_page_slots", wraps=manager._page_slots) as slots,
+            patch.object(
+                host, "get_page_buffer_meta", wraps=host.get_page_buffer_meta
+            ) as meta,
+            patch.object(
+                type(manager.components[0].writer), "upload_slots", return_value=[0, 0]
+            ) as upload,
+        ):
+            manager.prepare_read(keys, indices)
+            self.assertEqual(slots.call_count, 1)
+            self.assertEqual(manager.batch_set_v1(keys, indices), [True, True])
+            self.assertEqual(slots.call_count, 2)
+            meta.assert_not_called()
+            self.assertEqual(upload.call_count, 2)
+
+    def test_custom_source_mapping_rejects_other_component_buffer(self):
+        host = pool()
+        indices = torch.arange(host.page_size)
+        pointers, sizes = host.get_page_buffer_meta(indices)
+        with patch.object(
+            host, "get_page_buffer_meta", return_value=(pointers[::-1], sizes)
+        ):
+            adapter, _, _ = self.adapter(host=host)
+            with patch.object(
+                type(adapter.components[0].writer), "upload", return_value=[0]
+            ) as upload:
+                with self.assertRaisesRegex(ValueError, "source page spans"):
+                    adapter.batch_set_v1(["page"], indices)
+            upload.assert_not_called()
+
+    def test_custom_source_mapping_is_queried_for_the_actual_batch(self):
+        host = pool()
+        original = host.get_page_buffer_meta
+        indices = torch.tensor([8, 9, 10, 11, 0, 1, 2, 3])
+        remapped = indices.reshape(-1, host.page_size).flip(0).flatten()
+        pointers, sizes = original(remapped)
+        with patch.object(
+            host, "get_page_buffer_meta", return_value=(pointers, sizes)
+        ) as lookup:
+            adapter, _, _ = self.adapter(host=host)
+            with patch.object(
+                type(adapter.components[0].writer), "upload", return_value=[0, 0]
+            ) as upload:
+                self.assertEqual(
+                    adapter.batch_set_v1(["a", "b"], indices), [True, True]
+                )
+            lookup.assert_called_once_with(indices)
+            for plane, call in enumerate(upload.call_args_list):
+                self.assertEqual(call.args[1], [[p] for p in pointers[plane::2]])
+                self.assertEqual(call.args[2], [[n] for n in sizes[plane::2]])
 
     def test_sdk_round_trip_through_adapter(self):
         # One rank uses the real upload, discovery, planning and load code.
@@ -579,3 +666,7 @@ class TestReshardIntegration(unittest.TestCase):
         ):
             with self.assertRaises(ModuleNotFoundError):
                 get_reshard_reader_type()
+
+
+if __name__ == "__main__":
+    unittest.main()
