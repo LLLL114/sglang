@@ -35,12 +35,15 @@ def get_reshard_reader_type(name="gather"):
 def _store_formats():
     from mooncake.reshard.kv_cache import KVCacheStoreFormat
 
-    return {
+    formats = {
         "page_first": KVCacheStoreFormat.PLHD,
         "page_first_direct": KVCacheStoreFormat.LPHD,
         "layer_first": KVCacheStoreFormat.LPHD,
         "page_head": KVCacheStoreFormat.HPLD,
     }
+    if hasattr(KVCacheStoreFormat, "PAGE_UNIFIED"):
+        formats["page_unified"] = KVCacheStoreFormat.PAGE_UNIFIED
+    return formats
 
 
 def _digest(value):
@@ -90,7 +93,7 @@ def collect_reshard_metadata(controller, config):
     ):
         raise ValueError("unsupported KV Store host layout or dtype")
     if mla and (
-        pool.layout != "page_first_direct"
+        pool.layout not in ("page_first_direct", "page_unified")
         or not config.is_rank_replicated
         or pool.kv_buffer is None
         or pool.dsa_kv_cache_store_fp8
@@ -111,10 +114,12 @@ def collect_reshard_metadata(controller, config):
         "head_dim": pool.kv_cache_dim if mla else pool.head_dim,
         "dtype": str(pool.dtype).removeprefix("torch."),
         "page_size": pool.page_size,
-        "format": formats[pool.layout].value,
+        "format": formats["page_first_direct" if mla else pool.layout].value,
         "writer_instance": uuid.uuid4().hex,
         "hostname": socket.gethostname(),
     }
+    if pool.layout == "page_unified":
+        local["heads_per_group"] = pool.page_unified_layout.heads_per_group
     parts = [local]
     # TP first gathers one PP stage; PP then gathers every stage for each TP lane.
     for group in (controller.tp_group, controller.pp_group):
@@ -129,6 +134,10 @@ def collect_reshard_metadata(controller, config):
     if len(parts) != len(expected) or {(p["pp"], p["tp"]) for p in parts} != expected:
         raise ValueError("incomplete TP/PP ownership for KV Store reshard")
     for part in parts:
+        if part.get("heads_per_group") != local.get("heads_per_group"):
+            raise ValueError(
+                "inconsistent unified KV head grouping across source ranks"
+            )
         for field in ("head_dim", "dtype", "page_size", "format"):
             if part[field] != local[field]:
                 raise ValueError(f"inconsistent KV Store descriptor: {field}")
@@ -175,7 +184,9 @@ def make_placement(metadata, component):
     tp_size = metadata["tp_size"]
     descriptor = KVCacheDescriptor(
         global_layer_ids=tuple(range(metadata["num_layers"])),
-        components=(KVCacheComponent(component),),
+        components=(KVCacheComponent.KEY, KVCacheComponent.VALUE)
+        if component == "kv"
+        else (KVCacheComponent(component),),
         dtype=local["dtype"],
         itemsize={"float16": 2, "bfloat16": 2, "float32": 4}[local["dtype"]],
         page_size=local["page_size"],
@@ -258,9 +269,17 @@ class _ComponentIO:
         self._component = component
         self.placement = make_placement(metadata, component)
         self.participant = ParticipantId(f"pp{config.pp_rank}-tp{config.tp_rank}")
+        group = (
+            {"head_group_size": pool.page_unified_layout.heads_per_group}
+            if component == "kv"
+            else {}
+        )
         upload_plan = plan_kv_cache_store_upload(
             self.placement,
-            object_format=_store_formats()[pool.layout],
+            object_format=_store_formats()[
+                "page_first_direct" if component == "latent" else pool.layout
+            ],
+            **group,
         )
         manifest = KVCacheStoreManifest(
             str(config.extra_config.get("extra_backend_tag", "sglang")),
@@ -293,9 +312,12 @@ class _ComponentIO:
         (self._read_region,) = binding.regions
         self._write_spans = None
         self.target = StoreReadTarget(self.placement, binding, manifest.model_domain)
-        format_tag = {"key": "rsrg4_k", "value": "rsrg4_v", "latent": "rsrg2"}[
-            component
-        ]
+        format_tag = {
+            "key": "rsrg4_k",
+            "value": "rsrg4_v",
+            "latent": "rsrg2",
+            "kv": "rsrg_unified_kv",
+        }[component]
         self._key_suffix = f"_m{manifest.model_domain}_{format_tag}"
         logger.info(
             "Mooncake KV reshard registered layout=%s participant=%s manifest=%s part=%d/%d",
@@ -311,7 +333,10 @@ class _ComponentIO:
 
     @property
     def _tensor(self):
-        if self._component == "latent":
+        if self._component == "latent" and self.pool.layout == "page_unified":
+            # Unified MLA elides the singleton head axis of the LPHD latent view.
+            return self.pool.kv_buffer.unsqueeze(-2)
+        if self._component in ("latent", "kv"):
             return self.pool.kv_buffer
         return self.pool.k_buffer if self._component == "key" else self.pool.v_buffer
 
@@ -325,42 +350,73 @@ class _ComponentIO:
 
         pool = self.pool
         part = self.placement.part(self.participant)
-        # Indices of the layer, token and head axes in a single K or V allocation.
-        layer_axis, token_axis, head_axis = {
-            "layer_first": (0, 1, 2),
-            "page_first": (1, 0, 2),
-            "page_first_direct": (1, 2, 3),
-            "page_head": (3, 2, 1),
-        }[pool.layout]
-        # In page_head, a single head's tokens/layers precede the next head.
-        heads_per_range = 1 if pool.layout == "page_head" else part.head_count
         tensor = self._tensor
-        (component,) = self.placement.descriptor.components
         stride = tuple(s * tensor.element_size() for s in tensor.stride())
         region = KVCacheRegisteredRegion(
-            component.value,
+            self._component,
             "hicache-host",
             tensor.data_ptr(),
             (1 + sum((n - 1) * s for n, s in zip(tensor.shape, tensor.stride())))
             * tensor.element_size(),
         )
         ranges = []
-        for index, layer in enumerate(part.layer_ids):
-            for head in range(0, part.head_count, heads_per_range):
-                ranges.append(
-                    KVCacheResolvedRange(
-                        layer,
-                        component,
-                        0,
-                        pool.page_size,
-                        part.head_start + head,
-                        heads_per_range,
-                        component.value,
-                        index * stride[layer_axis] + head * stride[head_axis],
-                        stride[token_axis],
-                        stride[head_axis],
+        if self._component == "kv":
+            layout = pool.page_unified_layout
+            group_heads = layout.heads_per_group
+            if (
+                tuple(tensor.shape) != layout.page_dims(tensor.shape[0])
+                or not tensor.is_contiguous()
+            ):
+                raise ValueError("unexpected unified KV page storage")
+            for group in range(layout.head_group_num):
+                for layer_index, layer in enumerate(part.layer_ids):
+                    for plane, component in enumerate(
+                        self.placement.descriptor.components
+                    ):
+                        ranges.append(
+                            KVCacheResolvedRange(
+                                layer,
+                                component,
+                                0,
+                                pool.page_size,
+                                part.head_start + group * group_heads,
+                                group_heads,
+                                self._component,
+                                group * stride[1]
+                                + layer_index * stride[2]
+                                + plane * stride[3],
+                                stride[4],
+                                stride[5],
+                            )
+                        )
+        else:
+            # Indices of the layer, token and head axes in a single K or V allocation.
+            layer_axis, token_axis, head_axis = {
+                "layer_first": (0, 1, 2),
+                "page_first": (1, 0, 2),
+                "page_first_direct": (1, 2, 3),
+                "page_unified": (1, 2, 3),  # dense MLA latent view
+                "page_head": (3, 2, 1),
+            }[pool.layout]
+            # In page_head, a single head's tokens/layers precede the next head.
+            heads_per_range = 1 if pool.layout == "page_head" else part.head_count
+            (component,) = self.placement.descriptor.components
+            for index, layer in enumerate(part.layer_ids):
+                for head in range(0, part.head_count, heads_per_range):
+                    ranges.append(
+                        KVCacheResolvedRange(
+                            layer,
+                            component,
+                            0,
+                            pool.page_size,
+                            part.head_start + head,
+                            heads_per_range,
+                            self._component,
+                            index * stride[layer_axis] + head * stride[head_axis],
+                            stride[token_axis],
+                            stride[head_axis],
+                        )
                     )
-                )
         instance = uuid.uuid4().hex
         return KVCacheStoreRuntimeBinding(
             "page-template:" + instance,
@@ -401,7 +457,7 @@ class _ComponentIO:
         """Bind page-zero spans once; the pool signature guards later translations."""
         if self.writer is None:
             return
-        if self._component == "latent":
+        if self._component in ("latent", "kv"):
             page = self._tensor[0]
             blocks = (page,) if page.is_contiguous() else page.unbind(0)
             if not all(block.is_contiguous() for block in blocks):
@@ -473,12 +529,14 @@ class ReshardManager:
         names = (
             ("latent",)
             if config.kv_reshard_metadata.get("component") == "latent"
+            else ("kv",)
+            if pool.layout == "page_unified"
             else ("key", "value")
         )
         from sglang.srt.mem_cache.hicache_storage import STORAGE_BATCH_SIZE
 
         self.pool = pool
-        paged = pool.layout in ("page_first_direct", "page_head")
+        paged = pool.layout in ("page_first_direct", "page_head", "page_unified")
         self._slot_unit = pool.page_size if paged else 1
         self._store = store
         self._scratch_ptr = None
@@ -492,7 +550,7 @@ class ReshardManager:
             )
 
             page_meta = None
-            needs_meta = any(c._component != "latent" for c in self.components)
+            needs_meta = any(c._component in ("key", "value") for c in self.components)
             getter = pool.get_page_buffer_meta if needs_meta else None
             # Custom getters may use a non-affine mapping. Keep their per-batch lookup.
             affine = getattr(getter, "__func__", None) in (

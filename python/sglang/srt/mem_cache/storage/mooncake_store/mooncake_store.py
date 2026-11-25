@@ -1604,7 +1604,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 len(keys) / (end_time - start_time) * self.gb_per_page
             )
 
-        return self._batch_postprocess(get_results, is_set_operate=False)
+        return self._batch_postprocess(
+            get_results,
+            is_set_operate=False,
+            key_multiplier=len(key_strs) // len(keys) if keys else None,
+        )
 
     def batch_set_v1(
         self,

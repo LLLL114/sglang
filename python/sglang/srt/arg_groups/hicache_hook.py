@@ -207,10 +207,23 @@ def resolve_hicache_key_scheme(server_args: Any):
             "--hicache-storage-key-scheme unified names L3 objects, so it needs "
             "--hicache-storage-backend."
         )
-    if cfg.hicache_storage_backend != "file":
+    gather = False
+    if (
+        cfg.hicache_storage_backend == "mooncake"
+        and cfg.hicache_storage_backend_extra_config
+    ):
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+            HybridCacheController,
+        )
+
+        extra, *_ = HybridCacheController.parse_storage_backend_extra_config(
+            cfg.hicache_storage_backend_extra_config
+        )
+        gather = bool(extra.get("kv_reshard"))
+    if cfg.hicache_storage_backend != "file" and not gather:
         raise NotImplementedError(
-            f"--hicache-storage-key-scheme unified supports only the file "
-            f"backend; got {cfg.hicache_storage_backend!r}."
+            "--hicache-storage-key-scheme unified requires the file backend or "
+            f"Mooncake with kv_reshard enabled; got {cfg.hicache_storage_backend!r}."
         )
     if cfg.speculative_algorithm is not None:
         # Draft layers are appended to the host pool's layer axis but are not

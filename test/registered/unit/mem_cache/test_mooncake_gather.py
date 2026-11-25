@@ -523,18 +523,8 @@ class TestGatherStore(unittest.TestCase):
                 self.assertEqual(call.args[1], [[p] for p in pointers[plane::2]])
                 self.assertEqual(call.args[2], [[n] for n in sizes[plane::2]])
 
-    def test_sdk_round_trip_through_adapter(self):
-        # One rank uses the real upload, discovery, planning and load code.
-        # Only ordinary Store object I/O is replaced with in-process buffers.
-        cfg = config()
-        cfg.tp_size = cfg.pp_size = 1
-        host = pool(layers=5, heads=4)
-        cfg.kv_reshard_metadata = collect(
-            SimpleNamespace(
-                storage_host_pool=host, mem_pool_host=host, tp_group=None, pp_group=None
-            ),
-            cfg,
-        )
+    @staticmethod
+    def memory_store():
         objects = {}
         raw = Mock()
         raw.register_buffer.return_value = raw.unregister_buffer.return_value = 0
@@ -567,6 +557,126 @@ class TestGatherStore(unittest.TestCase):
             k: objects.get(k, b"") for k in keys
         }
         raw.get_into_ranges_from_snapshot.side_effect = get
+        return raw, objects
+
+    def test_unified_gather_restores_both_planes_with_different_head_groups(self):
+        from contextlib import nullcontext
+
+        from sglang.srt.mem_cache.pool_host.page_unified import PageUnifiedLayout
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeStore,
+        )
+
+        raw, objects = self.memory_store()
+        cfg = config()
+        cfg.tp_size = cfg.pp_size = 1
+        managers = []
+        tensors = []
+        for groups in (2, 4):
+            host = pool(layers=5, heads=4)
+            host.layout = "page_unified"
+            host.page_unified_layout = PageUnifiedLayout(
+                page_size=4,
+                layer_num=5,
+                head_num=4,
+                head_group_num=groups,
+                head_dim=8,
+                itemsize=2,
+            )
+            host.kv_buffer = torch.zeros(
+                host.page_unified_layout.page_dims(4), dtype=host.dtype
+            )
+            cfg.kv_reshard_metadata = collect(
+                SimpleNamespace(
+                    storage_host_pool=host,
+                    mem_pool_host=host,
+                    tp_group=None,
+                    pp_group=None,
+                ),
+                cfg,
+            )
+            manager = ReshardManager(raw, host, cfg)
+            self.addCleanup(manager.close)
+            managers.append(manager)
+            tensors.append(host.kv_buffer)
+        writer, reader = managers
+        src, dst = tensors
+        src[1].copy_(torch.arange(src[1].numel()).reshape_as(src[1]).remainder(997))
+        self.assertEqual(writer.batch_set_v1(["hit"], torch.arange(4, 8)), [True])
+        self.assertEqual(list(objects), reader.object_keys(["hit"]))
+        backend = MooncakeStore.__new__(MooncakeStore)
+        backend.config_prefix = None
+        backend.enable_storage_metrics = backend.is_mla_backend = (
+            backend.should_split_heads
+        ) = False
+        backend.kv_reshard = reader
+        backend.store = raw
+        backend.mem_pool_host = reader.pool
+        backend._request_context_from_extra_info = lambda _: {}
+        backend.request_context = lambda **kw: nullcontext()
+        self.assertEqual(backend.batch_exists(["hit", "missing"]), 1)
+        for slot in (2, 0):
+            indices = torch.arange(4 * slot, 4 * slot + 8)
+            self.assertEqual(
+                backend.batch_get_v1(["hit", "missing"], indices), [True, False]
+            )
+            # Two heads per group in the writer, one in the reader.
+            expected = src[1].permute(0, 4, 1, 2, 3, 5).reshape_as(dst[slot])
+            torch.testing.assert_close(dst[slot], expected, rtol=0, atol=0)
+
+    def test_unified_dense_latent_uses_the_registered_page_bytes(self):
+        from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+        from sglang.srt.mem_cache.pool_host.page_unified import PageUnifiedLayout
+
+        cfg = config()
+        cfg.is_mla_model = True
+        cfg.tp_size = cfg.pp_size = 1
+        host = MLATokenToKVPoolHost.__new__(MLATokenToKVPoolHost)
+        host.layout, host.dtype = "page_unified", torch.float16
+        host.size, host.page_size, host.kv_cache_dim = 16, 4, 8
+        host.start_layer, host.end_layer = 0, 5
+        host.layer_num = host.target_layer_num = 5
+        host.dsa_kv_cache_store_fp8 = False
+        host.page_unified_layout = PageUnifiedLayout(
+            page_size=4,
+            layer_num=5,
+            head_num=1,
+            head_group_num=1,
+            head_dim=8,
+            itemsize=2,
+            is_mla=True,
+        )
+        tensor = torch.zeros(host.page_unified_layout.page_dims(4), dtype=host.dtype)
+        host.kv_buffer = tensor
+        cfg.kv_reshard_metadata = collect(
+            SimpleNamespace(
+                storage_host_pool=host, mem_pool_host=host, tp_group=None, pp_group=None
+            ),
+            cfg,
+        )
+        raw, objects = self.memory_store()
+        manager = ReshardManager(raw, host, cfg)
+        self.addCleanup(manager.close)
+        tensor[1].copy_(torch.arange(tensor[1].numel()).reshape_as(tensor[1]))
+        self.assertEqual(manager.batch_set_v1(["hit"], torch.arange(4, 8)), [True])
+        self.assertEqual(list(objects), manager.object_keys(["hit"]))
+        args = manager.prepare_read(["hit"], torch.arange(8, 12))
+        self.assertEqual(manager.batch_get_into(*args), [tensor[1].nbytes])
+        torch.testing.assert_close(tensor[2], tensor[1], rtol=0, atol=0)
+
+    def test_sdk_round_trip_through_adapter(self):
+        # One rank uses the real upload, discovery, planning and load code.
+        # Only ordinary Store object I/O is replaced with in-process buffers.
+        cfg = config()
+        cfg.tp_size = cfg.pp_size = 1
+        host = pool(layers=5, heads=4)
+        cfg.kv_reshard_metadata = collect(
+            SimpleNamespace(
+                storage_host_pool=host, mem_pool_host=host, tp_group=None, pp_group=None
+            ),
+            cfg,
+        )
+        raw, objects = self.memory_store()
         adapter = ReshardManager(raw, host, cfg)
         self.addCleanup(adapter.close)
         for n, tensor in enumerate((host.k_buffer, host.v_buffer), start=1):
