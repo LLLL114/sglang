@@ -535,6 +535,15 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 if storage_config
                 else None
             )
+            # Honor the optional backend setting from older reshard configurations.
+            reshard_options = (extra_config or {}).get("kv_reshard")
+            if isinstance(reshard_options, dict) and "backend" in reshard_options:
+                if reshard_options["backend"] != os.environ.get(
+                    "MOONCAKE_STORE_BACKEND", "cpp"
+                ):
+                    raise ValueError(
+                        "kv_reshard.backend differs from the selected Mooncake Store backend"
+                    )
             self.enable_group_semantics = bool(
                 extra_config.get("enable_group_semantics", False)
                 if extra_config
@@ -653,6 +662,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     transfer_engine = None
 
                 setup_kwargs = {}
+                if os.environ.get("MOONCAKE_STORE_BACKEND") == "rs":
+                    identifier = "hicache-" + uuid.uuid4().hex
+                    setup_kwargs.update(
+                        stable_id=identifier, local_segment_name=identifier
+                    )
                 if self.config.enable_ssd_offload:
                     setup_kwargs["enable_ssd_offload"] = True
                 if self.config.ssd_offload_path is not None:
@@ -856,6 +870,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         assert self.store.get(warmup_key) == warmup_value
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
+        self.kv_reshard = None
         super().register_mem_pool_host(mem_pool_host)
         if getattr(self.mem_pool_host, "kv_buffer", None) is None:
             # Hybrid logical anchors only own allocation indices. Their physical
@@ -870,6 +885,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         bytes_per_page = mem_pool_host.get_ksize_per_token() * mem_pool_host.page_size
         self.gb_per_page = bytes_per_page / (1 << 30)
+        if getattr(self.storage_config, "kv_reshard_metadata", None) is not None:
+            from .reshard_adapter import ReshardManager
+
+            self.kv_reshard = ReshardManager(
+                self.store, self.mem_pool_host, self.storage_config
+            )
 
     def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
         # KV anchor memory is already registered via register_mem_pool_host().
@@ -1435,17 +1456,28 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             )
             return self._batch_io_v2(transfers, is_set=True, session_id=session_id)
 
+    def _kv_object_keys(self, keys):
+        """Encode tagged logical pages in the same order as their v1 buffers."""
+        manager = getattr(self, "kv_reshard", None)
+        if manager is not None:
+            return manager.object_keys(keys)
+        if self.is_mla_backend:
+            return [f"{key}_{self.mla_suffix}_k" for key in keys]
+        ranks = self.mha_suffix if self.should_split_heads else (self.mha_suffix,)
+        return [
+            f"{key}_{rank}_{component}"
+            for key in keys
+            for rank in ranks
+            for component in ("k", "v")
+        ]
+
     def _get_mha_split_heads_buffer_meta(self, keys, indices):
         ptr_list, element_size_list = (
             self.mem_pool_host.get_split_heads_page_buffer_meta(
                 indices, self.split_factor
             )
         )
-        key_list = []
-        for key_ in keys:
-            for suffix in self.mha_suffix:
-                key_list.append(f"{key_}_{suffix}_k")
-                key_list.append(f"{key_}_{suffix}_v")
+        key_list = self._kv_object_keys(keys)
         assert len(key_list) == len(ptr_list)
         return key_list, ptr_list, element_size_list
 
@@ -1474,10 +1506,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
     def _get_mha_buffer_meta(self, keys, indices):
         ptr_list, element_size_list = self.mem_pool_host.get_page_buffer_meta(indices)
-        key_list = []
-        for key_ in keys:
-            key_list.append(f"{key_}_{self.mha_suffix}_k")
-            key_list.append(f"{key_}_{self.mha_suffix}_v")
+        key_list = self._kv_object_keys(keys)
         if len(key_list) != len(ptr_list):
             raise RuntimeError(
                 "Mooncake layer_first multi-buffer is only supported for MLA "
@@ -1487,9 +1516,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
     def _get_mla_buffer_meta(self, keys, indices):
         ptr_list, element_size_list = self.mem_pool_host.get_page_buffer_meta(indices)
-        key_list = []
-        for key_ in keys:
-            key_list.append(f"{key_}_{self.mla_suffix}_k")
+        key_list = self._kv_object_keys(keys)
         ptr_list, element_size_list = self._pack_multi_buffer_meta(
             key_list, ptr_list, element_size_list
         )
@@ -1497,6 +1524,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         return key_list, ptr_list, element_size_list
 
     def _batch_preprocess(self, keys, host_indices):
+        manager = getattr(self, "kv_reshard", None)
+        if manager is not None:
+            return manager.prepare_read(keys, host_indices)
         assert len(keys) > 0
         page_size = (
             self.storage_config.logical_page_size
@@ -1561,7 +1591,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         start_time = time.perf_counter()
         with self.request_context(**self._request_context_from_extra_info(extra_info)):
             get_results = self._get_batch_zero_copy_impl(
-                key_strs, buffer_ptrs, buffer_sizes
+                key_strs,
+                buffer_ptrs,
+                buffer_sizes,
+                reshard=getattr(self, "kv_reshard", None),
             )
         end_time = time.perf_counter()
 
@@ -1579,6 +1612,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
+        if getattr(self, "kv_reshard", None) is not None:
+            with self.request_context(
+                **self._request_context_from_extra_info(extra_info)
+            ):
+                return self.kv_reshard.batch_set_v1(self._tag_keys(keys), host_indices)
         if self.mem_pool_host.kv_buffer is None:
             # DeepSeek V4's KV anchor is logical only; v2 side pools carry data.
             return [True] * len(keys)
@@ -1764,25 +1802,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def batch_exists(
         self, keys, extra_info: Optional[HiCacheStorageExtraInfo] = None
     ) -> int:
-        # Apply config prefix if available.
-        keys = self._tag_keys(keys)
-
-        if self.is_mla_backend:
-            query_keys = [f"{key}_{self.mla_suffix}_k" for key in keys]
-            key_multiplier = 1
-        else:
-            query_keys = []
-            if self.should_split_heads:
-                for key in keys:
-                    for suffix in self.mha_suffix:
-                        query_keys.append(f"{key}_{suffix}_k")
-                        query_keys.append(f"{key}_{suffix}_v")
-                key_multiplier = 2 * self.split_factor
-            else:
-                for key in keys:
-                    query_keys.append(f"{key}_{self.mha_suffix}_k")
-                    query_keys.append(f"{key}_{self.mha_suffix}_v")
-                key_multiplier = 2
+        if not keys:
+            return 0
+        query_keys = self._kv_object_keys(self._tag_keys(keys))
+        key_multiplier = len(query_keys) // len(keys)
 
         with self.request_context(**self._request_context_from_extra_info(extra_info)):
             exist_result = self._batch_exist(query_keys)
@@ -1792,9 +1815,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         return len(query_keys) // key_multiplier
 
     def close(self):
-        # MooncakeDistributedStore will automatically call the destructor, so
-        # it is unnecessary to close it manually.
-        pass
+        adapter = getattr(self, "kv_reshard", None)
+        if adapter is not None:
+            adapter.close()
 
     def clear(self) -> None:
         self.store.remove_all()
@@ -1833,8 +1856,38 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             return self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
 
     def _get_batch_zero_copy_impl(
-        self, key_strs: List[str], buffer_ptrs: List[Any], buffer_sizes: List[Any]
+        self,
+        key_strs: List[str],
+        buffer_ptrs: List[Any],
+        buffer_sizes: List[Any],
+        *,
+        reshard=None,
     ) -> List[int]:
+        if reshard is not None:
+            pages, remainder = divmod(len(key_strs), len(reshard.components))
+            if (
+                remainder
+                or len(buffer_ptrs) != len(key_strs)
+                or len(buffer_sizes) != len(key_strs)
+            ):
+                raise ValueError("invalid Gather read batch dimensions")
+            # prepare_read lays out one contiguous batch per component.
+            groups = []
+            for i, component in enumerate(reshard.components):
+                batch = slice(i * pages, (i + 1) * pages)
+                codes = reshard.reader.batch_get_into(
+                    key_strs[batch],
+                    buffer_ptrs[batch],
+                    buffer_sizes[batch],
+                    target_manifest=component.placement,
+                )
+                if len(codes) != pages:
+                    raise ValueError("unexpected Gather read result length")
+                groups.append(codes)
+            if len(groups) == 1:
+                return groups[0]
+            # Match the physical result order expected by _batch_postprocess.
+            return [code for page in zip(*groups, strict=True) for code in page]
         if self._uses_multi_buffer(buffer_ptrs):
             return self.store.batch_get_into_multi_buffers(
                 key_strs, buffer_ptrs, buffer_sizes

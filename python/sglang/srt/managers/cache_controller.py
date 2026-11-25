@@ -940,7 +940,7 @@ class HiCacheController:
                 for head_group in range(unified_plan.head_group_num)
             ]
 
-        return HiCacheStorageConfig(
+        config = HiCacheStorageConfig(
             tp_rank=tp_rank,
             tp_size=tp_size,
             pp_rank=parallel.pp_rank,
@@ -962,6 +962,15 @@ class HiCacheController:
             dcp_rank=get_parallel().attn_dcp_rank,
             logical_page_size=self.page_size if dcp_size > 1 else None,
         )
+        if storage_backend_extra_config.get("kv_reshard"):
+            if self.storage_backend_type != "mooncake":
+                raise ValueError("kv_reshard requires the Mooncake storage backend")
+            from sglang.srt.mem_cache.storage.mooncake_store.reshard_adapter import (
+                collect_reshard_metadata,
+            )
+
+            config.kv_reshard_metadata = collect_reshard_metadata(self, config)
+        return config
 
     def _build_unified_plan(
         self, model_name: Optional[str], attn_cp_size: int
