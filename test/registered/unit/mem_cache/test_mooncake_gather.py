@@ -1,6 +1,7 @@
 """CPU tests for the C++ Store rank-gather HiCache integration."""
 
 import ctypes
+import socket
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
@@ -155,6 +156,134 @@ class TestGatherStore(unittest.TestCase):
     def test_rank_gather_publishes_one_object_in_rank_order(self):
         self.check_rank_gather_publishes_one_object(False)
 
+    def test_peer_accepts_all_hits_from_the_missing_bitmap(self):
+        from sglang.srt.mem_cache.storage.mooncake_store.rank_gather import (
+            RankGatherWriter,
+        )
+
+        manager, _, store = self.adapter()
+        manifest = manager.components[0].writer.manifest
+        writer = RankGatherWriter(store, manifest, 1, self.writer_id, 2)
+        peer, coordinator = socket.socketpair()
+        with peer, coordinator:
+            writer._peers[0] = peer
+            coordinator.sendall(bytes(2))
+            coordinator.shutdown(socket.SHUT_WR)
+            spans = [(0, writer.part_sizes[1])]
+            self.assertEqual(writer.upload_slots(["a", "b"], [0, 1], spans, 1), [0, 0])
+
+    def test_writer_rejects_negative_spans_before_starting_a_batch(self):
+        manager, _, _ = self.adapter()
+        writer = manager.components[0].writer
+        size = writer.part_sizes[writer.rank]
+        with patch.object(writer, "_upload") as start_batch:
+            with self.assertRaisesRegex(ValueError, "payload size"):
+                writer.upload(["page"], [[0, 0]], [[size + 1, -1]])
+        start_batch.assert_not_called()
+
+    def test_peer_sends_adjacent_source_spans_before_releasing_them(self):
+        from sglang.srt.mem_cache.storage.mooncake_store import rank_gather
+
+        manager, _, store = self.adapter()
+        writer = rank_gather.RankGatherWriter(
+            store, manager.components[0].writer.manifest, 1, self.writer_id, 3
+        )
+
+        def rows(selected):
+            self.assertEqual(selected, [0, 2])
+            source = ctypes.create_string_buffer(b"abXYcde")
+            base = ctypes.addressof(source)
+            try:
+                yield [(base, 1), (base + 1, 1), (base + 4, 1)]
+                yield [(base + 5, 2)]
+            finally:
+                ctypes.memset(base, 0, len(source))
+
+        peer, coordinator = socket.socketpair()
+        with (
+            peer,
+            coordinator,
+            patch.object(rank_gather, "_view", wraps=rank_gather._view) as views,
+        ):
+            writer._peers[0] = peer
+            coordinator.sendall(bytes([1, 0, 1, 1, 1, 1]))
+            results = writer._send_pages(b"S", ["first", "hit", "last"], rows)
+            self.assertEqual(results, [0, 0, 0])
+            self.assertEqual(rank_gather._read_exact(coordinator, 6), b"Sabcde")
+            self.assertEqual([call.args[1] for call in views.call_args_list], [2, 3])
+
+    def test_failed_first_buffer_registration_releases_peers_without_publishing(self):
+        from sglang.srt.mem_cache.storage.mooncake_store.rank_gather import (
+            RankGatherWriter,
+        )
+
+        manager, _, store = self.adapter()
+        manifest = manager.components[0].writer.manifest
+        sizes = manifest.layout.part_sizes
+        writers = [
+            RankGatherWriter(store, manifest, rank, self.writer_id, 1)
+            for rank in range(len(sizes))
+        ]
+        buffers = [ctypes.create_string_buffer(n) for n in sizes]
+        store.batch_is_exist.return_value = [0]
+        store.register_buffer.return_value = -1
+        try:
+            with ThreadPoolExecutor(len(writers)) as executor:
+                tasks = [
+                    executor.submit(
+                        writer.upload, ["missing"], [[ctypes.addressof(buf)]], [[n]]
+                    )
+                    for writer, buf, n in zip(writers, buffers, sizes, strict=True)
+                ]
+                with self.assertRaisesRegex(RuntimeError, "failed to register"):
+                    tasks[0].result(timeout=10)
+                for peer in tasks[1:]:
+                    with self.assertRaises(ConnectionError):
+                        peer.result(timeout=10)
+            store.batch_put_from.assert_not_called()
+        finally:
+            for writer in writers:
+                writer.close()
+
+    def test_idempotent_put_only_acknowledges_readable_pages_and_can_retry(self):
+        from sglang.srt.mem_cache.storage.mooncake_store.rank_gather import (
+            RankGatherWriter,
+        )
+
+        manager, _, store = self.adapter()
+        manifest = manager.components[0].writer.manifest
+        sizes = manifest.layout.part_sizes
+        writers = [
+            RankGatherWriter(store, manifest, rank, self.writer_id, 2)
+            for rank in range(len(sizes))
+        ]
+        buffers = [ctypes.create_string_buffer(n) for n in sizes]
+        # Both puts report success, but an independent writer still owns the
+        # incomplete second key. Only that key should be sent on the retry.
+        store.batch_is_exist.side_effect = [[0, 0], [1, 0], [1, 0], [1], [1, 1]]
+        store.batch_put_from.side_effect = [[0, 0], [0]]
+        keys = ["complete", "in-progress"]
+        try:
+            with ThreadPoolExecutor(len(writers)) as pool:
+                for expected in ([0, -1], [0, 0], [0, 0]):
+                    tasks = [
+                        pool.submit(
+                            w.upload, keys, [[ctypes.addressof(buf)]] * 2, [[n]] * 2
+                        )
+                        for w, buf, n in zip(writers, buffers, sizes, strict=True)
+                    ]
+                    self.assertEqual(
+                        [t.result(timeout=10) for t in tasks], [expected] * len(writers)
+                    )
+            self.assertEqual(
+                [call.args[0] for call in store.batch_put_from.call_args_list],
+                [keys, [keys[1]]],
+            )
+            self.assertEqual(store.batch_is_exist.call_count, 5)
+        finally:
+            for writer in writers:
+                writer.close()
+
     def test_rank_gather_publishes_extended_header_before_all_rank_payloads(self):
         self.check_rank_gather_publishes_one_object(True)
 
@@ -162,18 +291,19 @@ class TestGatherStore(unittest.TestCase):
         from dataclasses import replace
 
         from mooncake.reshard.kv_cache import GATHER_HEADER_BYTES
+
         from sglang.srt.mem_cache.storage.mooncake_store.rank_gather import (
             RankGatherWriter,
         )
 
         adapter, _, _ = self.adapter(settings={"storage_mode": "rank_gather"})
         root = adapter.components[0].writer
-        root = RankGatherWriter(root.native, root.manifest, 0, self.writer_id, 1)
+        root = RankGatherWriter(root.native, root.manifest, 0, self.writer_id, 2)
         if extended:
             manifest = replace(
                 root.manifest, model_revision="long-revision-" + "x" * 9000
             )
-            root = RankGatherWriter(root.native, manifest, 0, self.writer_id, 1)
+            root = RankGatherWriter(root.native, manifest, 0, self.writer_id, 2)
             self.assertGreater(len(root.header), 2 * GATHER_HEADER_BYTES)
         else:
             self.assertEqual(len(root.header), GATHER_HEADER_BYTES)
@@ -188,7 +318,7 @@ class TestGatherStore(unittest.TestCase):
 
         root.native.batch_put_from.side_effect = put
         peers = [
-            RankGatherWriter(root.native, root.manifest, rank, self.writer_id, 1)
+            RankGatherWriter(root.native, root.manifest, rank, self.writer_id, 2)
             for rank in range(1, len(root.part_sizes))
         ]
         writers = [root, *peers]
@@ -197,20 +327,42 @@ class TestGatherStore(unittest.TestCase):
         ]
         buffers = [ctypes.create_string_buffer(data, len(data)) for data in contents]
         try:
-            with ThreadPoolExecutor(len(writers)) as executor:
-                for exists in (0, 1):
-                    root.native.batch_is_exist.return_value = [exists]
+            before = root.native.register_buffer.call_count
+            with (
+                patch.object(ctypes, "memmove", wraps=ctypes.memmove) as copy_bytes,
+                ThreadPoolExecutor(len(writers)) as executor,
+            ):
+                for iteration, mask in enumerate(([1], [0], [1], [0, 0], [0])):
+                    keys = ["page", "next"][: len(mask)]
+                    root.native.batch_is_exist.side_effect = (
+                        [mask, [1] * mask.count(0)] if 0 in mask else [mask]
+                    )
                     pending = [
                         executor.submit(
-                            w.upload, ["page"], [[ctypes.addressof(buf)]], [[len(buf)]]
+                            w.upload,
+                            keys,
+                            [[ctypes.addressof(buf)]] * len(keys),
+                            [[len(buf)]] * len(keys),
                         )
                         for w, buf in zip(writers, buffers)
                     ]
                     self.assertEqual(
-                        [f.result() for f in pending], [[0]] * len(writers)
+                        [f.result() for f in pending], [[0] * len(keys)] * len(writers)
                     )
-            root.native.batch_put_from.assert_called_once()
-            self.assertEqual(list(written), ["page"])
+                    self.assertEqual(
+                        root.native.register_buffer.call_count - before,
+                        int(iteration > 0),
+                    )
+                self.assertEqual(
+                    sum(
+                        call.args[1] is root.header
+                        for call in copy_bytes.call_args_list
+                    ),
+                    2,
+                )
+            self.assertEqual(root.native.batch_put_from.call_count, 3)
+            self.assertEqual(list(written), ["page", "next"])
+            self.assertEqual(written["next"], written["page"])
             self.assertEqual(written["page"][: len(root.header)], root.header)
             self.assertEqual(written["page"][len(root.header) :], b"".join(contents))
         finally:
