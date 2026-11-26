@@ -2,8 +2,11 @@
 
 import ctypes
 import socket
+import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -99,11 +102,80 @@ def collect(ctrl, cfg, total_kv_heads=4):
         return collect_reshard_metadata(ctrl, cfg)
 
 
+def _check_attach_consensus(rank, directory):
+    dist = torch.distributed
+    timeout = timedelta(seconds=10)
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{directory}/rdzv",
+        rank=rank,
+        world_size=4,
+        timeout=timeout,
+    )
+    try:
+        for ranks in ([0, 1], [2, 3], [0, 2], [1, 3]):
+            g = dist.new_group(ranks, timeout=timeout)
+            if rank in ranks:
+                if ranks[0] // 2 == ranks[1] // 2:
+                    tp = g
+                else:
+                    pp = g
+        cfg = config()
+        cfg.pp_rank, cfg.tp_rank = divmod(rank, 2)
+        host = pool(
+            layers=3 if cfg.pp_rank == 0 else 2, start=0 if cfg.pp_rank == 0 else 3
+        )
+        ctrl = SimpleNamespace(
+            storage_host_pool=host, mem_pool_host=host, tp_group=tp, pp_group=pp
+        )
+        model = SimpleNamespace(
+            is_multimodal=False,
+            num_hidden_layers=5,
+            get_total_num_kv_heads=lambda: 4,
+            hf_config=SimpleNamespace(to_dict=lambda: {}),
+        )
+        with (
+            patch(
+                "sglang.srt.runtime_context.get_server_args",
+                return_value=SimpleNamespace(),
+            ),
+            patch(
+                "sglang.srt.runtime_context.process_model_config", return_value=model
+            ),
+        ):
+            if rank == 2:
+                host.v_head_dim += 1
+            try:
+                collect_reshard_metadata(ctrl, cfg)
+            except Exception as exc:
+                diagnostic = str(exc)
+            else:
+                diagnostic = "unexpected success"
+            Path(directory, f"rank-{rank}").write_text(diagnostic)
+            host.v_head_dim = host.head_dim
+            # All ranks left both axes of the failed attempt in sync.
+            metadata = collect_reshard_metadata(ctrl, cfg)
+            assert len(metadata["parts"]) == 4
+    finally:
+        dist.destroy_process_group()
+
+
 @unittest.skipUnless(
     get_reshard_reader_type() is not None,
     "requires the optional Mooncake reshard SDK with GatherPageReader",
 )
 class TestGatherStore(unittest.TestCase):
+    def test_attach_failure_is_agreed_across_tp_and_pp(self):
+        with tempfile.TemporaryDirectory() as directory:
+            torch.multiprocessing.spawn(
+                _check_attach_consensus, args=(directory,), nprocs=4
+            )
+            messages = {
+                Path(directory, f"rank-{rank}").read_text() for rank in range(4)
+            }
+            self.assertEqual(len(messages), 1)
+            self.assertRegex(messages.pop(), r"PP1/TP0.*matching K/V dimensions")
+
     def test_collects_actual_unequal_layers_and_shared_writer_cohort(self):
         host = pool()
         ctrl = SimpleNamespace(

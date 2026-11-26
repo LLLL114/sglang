@@ -52,8 +52,7 @@ def _digest(value):
     ).hexdigest()
 
 
-def collect_reshard_metadata(controller, config):
-    """Collect actual rank ownership on the existing CPU groups at attach time."""
+def _local_reshard_metadata(controller, config):
     from sglang.srt.mem_cache.hicache_storage import PoolName
     from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
     from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
@@ -120,6 +119,30 @@ def collect_reshard_metadata(controller, config):
     }
     if pool.layout == "page_unified":
         local["heads_per_group"] = pool.page_unified_layout.heads_per_group
+    semantic = model.hf_config.to_dict()
+    for field in ("_name_or_path", "transformers_version", "_commit_hash"):
+        semantic.pop(field, None)
+    local["model_info"] = {
+        "total_kv_heads": 1 if mla else model.get_total_num_kv_heads(),
+        "component": "latent" if mla else None,
+        "num_layers": model.num_hidden_layers,
+        "model_name": config.model_name,
+        "model_revision": options["model_revision"],
+        "semantic": _digest(semantic),
+    }
+    return local
+
+
+def collect_reshard_metadata(controller, config):
+    """Exchange either metadata or a local error on both axes before returning."""
+    try:
+        local = _local_reshard_metadata(controller, config)
+    except Exception as exc:
+        local = {
+            "pp": config.pp_rank,
+            "tp": config.tp_rank,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
     parts = [local]
     # TP first gathers one PP stage; PP then gathers every stage for each TP lane.
     for group in (controller.tp_group, controller.pp_group):
@@ -128,12 +151,18 @@ def collect_reshard_metadata(controller, config):
             torch.distributed.all_gather_object(gathered, parts, group=group)
             parts = [part for group_parts in gathered for part in group_parts]
     parts = sorted(parts, key=lambda part: (part["pp"], part["tp"]))
+    errors = [f"PP{p['pp']}/TP{p['tp']}: {p['error']}" for p in parts if "error" in p]
+    if errors:
+        raise ValueError("KV Store reshard attach failed: " + "; ".join(errors))
+    model_info = parts[0]["model_info"]
     expected = {
         (pp, tp) for pp in range(config.pp_size) for tp in range(config.tp_size)
     }
     if len(parts) != len(expected) or {(p["pp"], p["tp"]) for p in parts} != expected:
         raise ValueError("incomplete TP/PP ownership for KV Store reshard")
     for part in parts:
+        if part.pop("model_info") != model_info:
+            raise ValueError("inconsistent KV Store model identity across ranks")
         if part.get("heads_per_group") != local.get("heads_per_group"):
             raise ValueError(
                 "inconsistent unified KV head grouping across source ranks"
@@ -143,18 +172,10 @@ def collect_reshard_metadata(controller, config):
                 raise ValueError(f"inconsistent KV Store descriptor: {field}")
     if len({p["hostname"] for p in parts}) != 1:
         raise ValueError("rank gather requires all TP/PP ranks on one host")
-    semantic = model.hf_config.to_dict()
-    for field in ("_name_or_path", "transformers_version", "_commit_hash"):
-        semantic.pop(field, None)
     return {
+        **model_info,
         "parts": parts,
         "writer_id": _digest([(p["pp"], p["tp"], p["writer_instance"]) for p in parts]),
-        "total_kv_heads": 1 if mla else model.get_total_num_kv_heads(),
-        "component": "latent" if mla else None,
-        "num_layers": model.num_hidden_layers,
-        "model_name": config.model_name,
-        "model_revision": options["model_revision"],
-        "semantic": _digest(semantic),
         "tp_size": config.tp_size,
         "pp_size": config.pp_size,
     }

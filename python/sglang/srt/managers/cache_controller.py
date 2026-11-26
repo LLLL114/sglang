@@ -729,14 +729,14 @@ class HiCacheController:
         from sglang.srt.mem_cache.utils import get_hash_str
 
         self.get_hash_str = get_hash_str
-        self.storage_config = self._generate_storage_config(
-            model_name, storage_backend_extra_config
-        )
 
         # Use storage backend factory for dynamic backend creation
         from sglang.srt.mem_cache.storage import StorageBackendFactory
 
         try:
+            self.storage_config = self._generate_storage_config(
+                model_name, storage_backend_extra_config
+            )
             self.storage_backend = StorageBackendFactory.create_backend(
                 storage_backend, self.storage_config, self.storage_host_pool
             )
