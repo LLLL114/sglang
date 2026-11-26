@@ -6150,20 +6150,19 @@ class Scheduler(
             logger.exception("Detach HiCache storage backend failed with exception.")
             return DetachHiCacheStorageReqOutput(success=False, message=str(e))
 
-        if ok or (not self.enable_hicache_storage):
-            # Treat "already disabled / nothing to do" as success for idempotence.
+        # A failed close can leave stopped workers and a backend retained for
+        # cleanup. Disable scheduling I/O, but report failure until detach succeeds.
+        if ok or getattr(self.tree_cache, "enable_storage", None) is False:
             self.enable_hicache_storage = False
             get_context().override(
                 "scheduler.detach_hicache",
                 hicache_storage_backend=None,
                 hicache_storage_backend_extra_config=None,
             )
+        if ok:
             logger.info("Detached HiCache storage backend.")
-            return DetachHiCacheStorageReqOutput(
-                success=True, message=msg or "HiCache storage backend is detached."
-            )
-
-        return DetachHiCacheStorageReqOutput(success=False, message=msg)
+            msg = msg or "HiCache storage backend is detached."
+        return DetachHiCacheStorageReqOutput(success=ok, message=msg)
 
     def flush_cache(self, empty_cache: bool = True):
         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""

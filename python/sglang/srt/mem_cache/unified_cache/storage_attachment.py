@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Optional
 
+from sglang.srt.managers.cache_controller import StorageBackendCloseError
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.buffer_mode.pipeline import validate_buffer_only_stack
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
@@ -206,12 +207,18 @@ class StorageAttachment:
         if controller is None:
             return False, "HiCache storage backend is not initialized."
 
+        close_error = None
         try:
             cache.drain_storage_control_queues_local()
             # Idempotent: ask the controller to clean up even when `enable_storage`
             # is already False, since that may be leftover state from an earlier
             # partial detach.
             controller.detach_storage_backend()
+        except StorageBackendCloseError as exc:
+            # Workers have stopped. Finish tree cleanup and leave the backend
+            # handle in the controller for a retry; do not advertise active I/O.
+            close_error = exc
+            logger.exception("HiCache backend cleanup is pending")
         except Exception as e:
             logger.exception("Failed to detach storage backend.")
             # Never crash the server for an admin operation. The controller raises
@@ -227,6 +234,8 @@ class StorageAttachment:
 
         cache.enable_storage = False
         cache.enable_storage_metrics = False
+        if close_error is not None:
+            return False, str(close_error)
         return True, "Detached HiCache storage backend successfully."
 
     def shutdown(self) -> None:
@@ -236,7 +245,11 @@ class StorageAttachment:
         via CLI args or via the admin API is detached on exit.
         """
         try:
-            if self._cache.enable_storage:
+            if (
+                self._cache.enable_storage
+                or getattr(self._cache.cache_controller, "storage_backend", None)
+                is not None
+            ):
                 self.detach()
         except Exception:
             logger.exception("Failed to detach storage backend on process shutdown.")

@@ -59,6 +59,25 @@ class TestSchedulerHiCacheAttach(CustomTestCase):
         )
         self.assertIsNone(self.server_args.hicache_storage_backend)
 
+    def test_detach_pending_cleanup_disables_io_and_preserves_failure(self):
+        scheduler = self._scheduler(hicache_storage_backend="mooncake")
+        scheduler.enable_hicache_storage = True
+        scheduler.tree_cache.enable_storage = False
+        scheduler.tree_cache.detach_storage_backend = lambda: (False, "retry detach")
+        for _ in range(2):
+            out = scheduler.detach_hicache_storage_wrapped(
+                DetachHiCacheStorageReqInput()
+            )
+            self.assertFalse(out.success)
+            self.assertFalse(scheduler.enable_hicache_storage)
+            self.assertIsNone(get_memory().hicache_storage_backend)
+        scheduler.tree_cache.detach_storage_backend = lambda: (True, "detached")
+        self.assertTrue(
+            scheduler.detach_hicache_storage_wrapped(
+                DetachHiCacheStorageReqInput()
+            ).success
+        )
+
     def test_detach_clears_the_backend_for_the_same_readers(self):
         scheduler = self._scheduler(hicache_storage_backend="file")
         scheduler.enable_hicache_storage = True

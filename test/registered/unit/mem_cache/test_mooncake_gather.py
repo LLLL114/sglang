@@ -153,6 +153,15 @@ def _check_attach_consensus(rank, directory):
                 diagnostic = "unexpected success"
             Path(directory, f"rank-{rank}").write_text(diagnostic)
             host.v_head_dim = host.head_dim
+            if rank == 1:
+                ctrl.storage_backend = object()
+            try:
+                collect_reshard_metadata(ctrl, cfg)
+            except ValueError as exc:
+                assert "PP0/TP1" in str(exc) and "retry detach" in str(exc)
+            else:
+                raise AssertionError("expected a coordinated cleanup-pending error")
+            ctrl.storage_backend = None
             # All ranks left both axes of the failed attempt in sync.
             metadata = collect_reshard_metadata(ctrl, cfg)
             assert len(metadata["parts"]) == 4
@@ -229,6 +238,62 @@ class TestGatherStore(unittest.TestCase):
         adapter = ReshardManager(raw, host, cfg)
         self.addCleanup(adapter.close)
         return adapter, host, raw
+
+    def test_detach_attempts_all_unregistrations_and_can_retry(self):
+        from threading import Event
+
+        from sglang.srt.managers.cache_controller import HiCacheController
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeStore,
+        )
+        from sglang.srt.mem_cache.unified_cache.storage_attachment import (
+            StorageAttachment,
+        )
+
+        manager, _, raw = self.adapter()
+        pointers = []
+        for component in manager.components:
+            writer = component.writer
+            writer._pages = writer._allocate(writer.max_pages * writer.page_bytes)
+            pointers.append(writer._pages.data_ptr())
+        scratch = manager._scratch_ptr
+        reader = Mock()
+        manager.reader = reader
+        pending = {pointers[0]}
+
+        def unregister(ptr):
+            if ptr in pending:
+                pending.remove(ptr)
+                return -1
+            return 0
+
+        raw.unregister_buffer.side_effect = unregister
+        backend = MooncakeStore.__new__(MooncakeStore)
+        backend.kv_reshard = manager
+        cc = HiCacheController.__new__(HiCacheController)
+        cc.storage_backend, cc.enable_storage = backend, True
+        cc.storage_stop_event = Event()
+        cc._stop_storage_threads = Mock()
+        cc._destroy_sync_groups = Mock()
+        cc.prefetch_hits_sync_groups, cc.prefetch_completion_sync_groups = [], []
+        cache = Mock(cache_controller=cc, enable_storage=True)
+        attachment = StorageAttachment(cache)
+        with patch.object(attachment, "_release_pending_storage_ops"):
+            ok, message = attachment.detach()
+            calls = [c.args[0] for c in raw.unregister_buffer.call_args_list]
+            self.assertCountEqual(calls, [*pointers, scratch])
+            self.assertFalse(ok)
+            self.assertIn("detach", message.lower())
+            self.assertFalse(cache.enable_storage)
+            self.assertFalse(cc.enable_storage)
+            self.assertIs(cc.storage_backend, backend)
+            with self.assertRaisesRegex(RuntimeError, "detach"):
+                cc.attach_storage_backend("mooncake")
+            self.assertTrue(attachment.detach()[0])
+        self.assertIsNone(cc.storage_backend)
+        self.assertEqual(raw.unregister_buffer.call_args_list[-1].args, (pointers[0],))
+        self.assertEqual(raw.unregister_buffer.call_count, 4)
+        reader.close.assert_called_once()
 
     def test_reader_supplies_registration_size_with_legacy_fallback(self):
         from mooncake.reshard.kv_cache import GATHER_HEADER_BYTES

@@ -8,6 +8,7 @@ import json
 import logging
 import socket
 import uuid
+from contextlib import ExitStack
 from importlib import import_module
 
 import torch
@@ -58,6 +59,10 @@ def _local_reshard_metadata(controller, config):
     from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
     from sglang.srt.runtime_context import get_server_args, process_model_config
 
+    if getattr(controller, "storage_backend", None) is not None:
+        raise RuntimeError(
+            "Previous storage backend cleanup is pending; retry detach before attaching."
+        )
     formats = _store_formats()
     options = config.extra_config["kv_reshard"]
     pool = controller.storage_host_pool
@@ -453,6 +458,7 @@ class _ComponentIO:
         """Release adapter-owned resources after HiCache has drained pending I/O."""
         if self.writer is not None:
             self.writer.close()
+            self.writer = None
 
     def _current_pool_signature(self):
         t = self._tensor
@@ -687,12 +693,19 @@ class ReshardManager:
             all(code == 0 for code in page) for page in zip(*per_component, strict=True)
         ]
 
+    def _unregister_scratch(self):
+        if self._store.unregister_buffer(self._scratch_ptr) != 0:
+            raise RuntimeError("failed to unregister GatherPageReader scratch")
+        self._scratch_ptr = None
+
     def close(self):
-        if close_reader := getattr(getattr(self, "reader", None), "close", None):
-            close_reader()
-        for c in self.components:
-            c.close()
-        if self._scratch_ptr is not None:
-            if self._store.unregister_buffer(self._scratch_ptr) != 0:
-                raise RuntimeError("failed to unregister GatherPageReader scratch")
-            self._scratch_ptr = None
+        # Attempt each independent release, even if a previous one failed.
+        # Clear ownership only on success so a second detach can finish cleanup.
+        with ExitStack() as releases:
+            if self._scratch_ptr is not None:
+                releases.callback(self._unregister_scratch)
+            for component in reversed(self.components):
+                releases.callback(component.close)
+            if close_reader := getattr(getattr(self, "reader", None), "close", None):
+                close_reader()
+            self.reader = None

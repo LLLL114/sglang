@@ -343,6 +343,10 @@ def check_dcp_l3_extra_pool(entry: Any, anchor: Any) -> None:
     )
 
 
+class StorageBackendCloseError(RuntimeError):
+    """The storage workers stopped but a backend still owns resources."""
+
+
 class HiCacheController:
     def __init__(
         self,
@@ -670,15 +674,22 @@ class HiCacheController:
         """
         if self.enable_storage:
             raise RuntimeError("Storage backend already attached.")
+        gather = storage_backend == "mooncake" and (
+            storage_backend_extra_config or {}
+        ).get("kv_reshard")
+        cleanup_pending = getattr(self, "storage_backend", None) is not None
+        # Gather reports a retained handle through the TP/PP metadata exchange:
+        # failing only on its owner here would strand the other ranks.
+        if cleanup_pending and not gather:
+            raise RuntimeError(
+                "Previous storage backend cleanup is pending; retry detach before attaching."
+            )
         key_scheme = get_memory().hicache_storage_key_scheme
         if key_scheme != "unified" and self.storage_host_pool.layout == "page_unified":
             raise ValueError(
                 "The page_unified host layout requires unified storage keys "
                 "to distinguish its byte order."
             )
-        gather = storage_backend == "mooncake" and (
-            storage_backend_extra_config or {}
-        ).get("kv_reshard")
         if key_scheme == "unified" and storage_backend != "file" and not gather:
             raise NotImplementedError(
                 "The unified key scheme requires the file backend or Mooncake with kv_reshard enabled."
@@ -725,6 +736,7 @@ class HiCacheController:
 
         # Rollback-safe init: if creation fails, keep controller state consistent
         # for future attach attempts.
+        previous_backend_type = getattr(self, "storage_backend_type", None)
         self.storage_backend_type = storage_backend
         from sglang.srt.mem_cache.utils import get_hash_str
 
@@ -806,27 +818,32 @@ class HiCacheController:
             self._destroy_sync_groups(self.prefetch_completion_sync_groups)
             self.prefetch_hits_sync_groups = []
             self.prefetch_completion_sync_groups = []
-            try:
-                if (
-                    hasattr(self, "storage_backend")
-                    and self.storage_backend is not None
-                ):
-                    if hasattr(self.storage_backend, "close"):
-                        self.storage_backend.close()
-            except Exception:
-                pass
-            self.storage_backend = None
-            self.storage_backend_type = None
             self.enable_storage = False
             self.page_get_func = self._generic_page_get
             self.page_set_func = self._generic_page_set
+            if cleanup_pending:
+                self.storage_backend_type = previous_backend_type
+            else:
+                self._close_storage_backend()
             raise
+
+    def _close_storage_backend(self):
+        backend = getattr(self, "storage_backend", None)
+        if backend is not None and hasattr(backend, "close"):
+            try:
+                backend.close()
+            except Exception as exc:
+                raise StorageBackendCloseError(
+                    f"Storage backend cleanup failed; retry detach: {exc}"
+                ) from exc
+        self.storage_backend = None
+        self.storage_backend_type = None
 
     def detach_storage_backend(self):
         """Detach (disable) storage backend at runtime.
 
         Requirement: no in-flight requests. This will stop storage threads and release
-        the backend instance (best-effort close).
+        the backend instance. A failed close keeps the backend for a retry.
         """
         # Idempotent cleanup: even if `enable_storage` is already False,
         # we may still have leftover resources (threads/backend/process group) from a
@@ -849,22 +866,10 @@ class HiCacheController:
         self.prefetch_hits_sync_groups = []
         self.prefetch_completion_sync_groups = []
 
-        # Best-effort close (some backends rely on GC/destructor).
-        try:
-            if (
-                hasattr(self, "storage_backend")
-                and self.storage_backend is not None
-                and hasattr(self.storage_backend, "close")
-            ):
-                self.storage_backend.close()
-        except Exception:
-            logger.exception("Failed to close storage backend cleanly.")
-
-        self.storage_backend = None
-        self.storage_backend_type = None
         self.enable_storage = False
         self.page_get_func = self._generic_page_get
         self.page_set_func = self._generic_page_set
+        self._close_storage_backend()
         # Now it's safe to clear the stop event for future re-attach.
         self.storage_stop_event.clear()
 
