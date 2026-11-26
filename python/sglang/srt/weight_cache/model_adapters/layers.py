@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Layout helpers for explicitly supported native, unquantized SGLang layers."""
 
+import torch
+
 from sglang.srt.distributed.utils import get_group_rank_size
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -247,12 +249,32 @@ class LayerLayoutBuilder(WeightLayoutBuilder):
             or method.w13_swiglu_interleaved
             or module.num_fused_shared_experts
             or module._expert_storage_rank != module.moe_ep_rank
-            or get_global_expert_location_metadata() is not None
         ):
             raise WeightManifestError(
                 f"unsupported MoE layout: {name}; use the triton backend without EPLB, "
                 "shared-expert fusion or SGLANG_OPT_FUSE_SWIGLU_INTERLEAVED"
             )
+        metadata = get_global_expert_location_metadata()
+        if metadata is not None:
+            count = module._num_global_routed
+            layer_id = module.layer_id
+            if (
+                metadata.num_physical_experts != count
+                or metadata.num_logical_experts != count
+                or not 0 <= layer_id < metadata.num_layers
+                or not torch.equal(
+                    metadata.physical_to_logical_map_cpu[layer_id],
+                    torch.arange(
+                        count,
+                        dtype=metadata.physical_to_logical_map_cpu.dtype,
+                        device="cpu",
+                    ),
+                )
+            ):
+                raise WeightManifestError(
+                    f"unsupported expert mapping: {name}; require a complete identity "
+                    "mapping without redundant or reordered experts"
+                )
         local_experts = module.num_local_experts
         intermediate = module.intermediate_size_per_partition
         hidden = module.hidden_size

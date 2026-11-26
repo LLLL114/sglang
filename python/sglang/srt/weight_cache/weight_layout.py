@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import prod
 from typing import Any
 
@@ -53,6 +53,11 @@ def registered_tensors(model):
     )
 
 
+def _layout_storage_key(tensor):
+    # Meta tensors have no allocation and all report the same null data pointer.
+    return ("meta", id(tensor)) if tensor.is_meta else _storage_key(tensor)
+
+
 @dataclass(frozen=True)
 class WeightLayoutPlan:
     tensors: tuple[LogicalWeightTensor, ...]
@@ -62,22 +67,99 @@ class WeightLayoutPlan:
     derived_state: tuple[str, ...]
     bindings: dict[str, tuple]
 
+    def _with_tensors(self, tensors):
+        return replace(
+            self,
+            views=tuple(
+                replace(v, parameter=tensors[v.parameter_names[0]]) for v in self.views
+            ),
+            initializations=tuple(
+                replace(v, parameter=tensors[v.parameter_names[0]])
+                for v in self.initializations
+            ),
+            bindings={n: _layout_storage_key(tensors[n]) for n in self.bindings},
+        )
+
+    def as_meta(self, model):
+        """Detach a stopped epoch's geometry without retaining tensor attributes."""
+        self.validate_bindings(model)
+        tensors, by_storage = {}, {}
+        for name, tensor in registered_tensors(model).items():
+            key = _layout_storage_key(tensor)
+            if key not in by_storage:
+                by_storage[key] = torch.empty_strided(
+                    tensor.shape, tensor.stride(), dtype=tensor.dtype, device="meta"
+                )
+            tensors[name] = by_storage[key]
+        return self._with_tensors(tensors), tensors
+
+    def rebind(self, model, previous_tensors):
+        """Rebind same-epoch meta geometry through all physical builder checks."""
+        builder = WeightLayoutBuilder(model)
+        if set(builder.tensors) != set(previous_tensors):
+            raise WeightManifestError("registered tensor names changed before rebind")
+        previous_names = {}
+        for name, tensor in previous_tensors.items():
+            if not tensor.is_meta:
+                raise WeightManifestError(
+                    "layout rebind requires detached meta tensors"
+                )
+            previous_names.setdefault(id(tensor), []).append(name)
+        for name, current in builder.tensors.items():
+            previous = previous_tensors[name]
+            aliases = tuple(sorted(previous_names[id(previous)]))
+            if (
+                tuple(current.shape) != tuple(previous.shape)
+                or tuple(current.stride()) != tuple(previous.stride())
+                or current.dtype != previous.dtype
+                or tuple(sorted(builder._names[_layout_storage_key(current)]))
+                != aliases
+            ):
+                raise WeightManifestError(f"layout geometry or aliases changed: {name}")
+            if name not in self.local_buffers:
+                builder._parameter_names(current)
+        for region in (*self.views, *self.initializations):
+            previous = previous_tensors[region.parameter_names[0]]
+            if region.parameter is not previous or region.parameter_names != tuple(
+                sorted(previous_names[id(previous)])
+            ):
+                raise WeightManifestError(
+                    "layout template references unexpected storage"
+                )
+        rebound = self._with_tensors(builder.tensors)
+        for region in (*rebound.views, *rebound.initializations):
+            builder._check_range(region)
+        builder._views = list(rebound.views)
+        builder._initializations = list(rebound.initializations)
+        builder._declarations = {t.tensor_id: t for t in self.tensors}
+        for name in self.local_buffers:
+            builder.local_buffer(name)
+        builder.derived(*self.derived_state)
+        result = builder.build()
+        result.validate_derived_state(model)
+        return result
+
     def validate_bindings(self, model) -> None:
         tensors = registered_tensors(model)
+        signatures = {}
+
+        def signature(tensor):
+            identity = id(tensor)
+            if identity not in signatures:
+                signatures[identity] = _layout_storage_key(tensor)
+            return signatures[identity]
+
         if set(tensors) != self.bindings.keys() | self.local_buffers:
             raise WeightManifestError(
                 "registered tensor names changed after layout construction"
             )
-        for name, signature in self.bindings.items():
-            if _storage_key(tensors[name]) != signature:
+        for name, expected in self.bindings.items():
+            if signature(tensors[name]) != expected:
                 raise WeightManifestError(
                     f"weight storage changed after layout construction: {name}"
                 )
         for region in (*self.views, *self.initializations):
-            if (
-                _storage_key(region.parameter)
-                != self.bindings[region.parameter_names[0]]
-            ):
+            if signature(region.parameter) != self.bindings[region.parameter_names[0]]:
                 raise WeightManifestError(
                     f"declared tensor storage changed: {region.parameter_names[0]}"
                 )
@@ -110,12 +192,13 @@ class WeightLayoutBuilder:
     tensor transforms and per-element fragmentation are deliberately unsupported.
     """
 
-    def __init__(self, model: Any):
+    def __init__(self, model: Any, *, allow_meta: bool = False):
         self.model = model
+        self.allow_meta = allow_meta
         self.tensors = registered_tensors(model)
         self._names = {}
         for name, tensor in self.tensors.items():
-            self._names.setdefault(_storage_key(tensor), []).append(name)
+            self._names.setdefault(_layout_storage_key(tensor), []).append(name)
         self._views = []
         self._initializations = []
         self._local_buffers = set()
@@ -125,7 +208,7 @@ class WeightLayoutBuilder:
         self._declarations = {}
 
     def _parameter_names(self, tensor):
-        names = self._names.get(_storage_key(tensor))
+        names = self._names.get(_layout_storage_key(tensor))
         if names is None:
             raise WeightManifestError(
                 "layout region does not reference registered storage"
@@ -133,7 +216,7 @@ class WeightLayoutBuilder:
         if (
             tensor.is_sparse
             or not tensor.is_contiguous()
-            or tensor.device.type == "meta"
+            or (tensor.is_meta and not self.allow_meta)
         ):
             raise WeightManifestError(f"unsupported runtime storage: {names[0]}")
         return tuple(sorted(names))
@@ -167,7 +250,7 @@ class WeightLayoutBuilder:
         ):
             raise WeightManifestError(f"invalid logical region: {tensor_id}")
         names = self._parameter_names(tensor)
-        self.declare(
+        self._declare(
             tensor,
             tensor_id,
             global_shape=global_shape,
@@ -222,6 +305,26 @@ class WeightLayoutBuilder:
     ):
         """Keep ownership even when this rank has only vocabulary padding."""
         self._parameter_names(tensor)
+        self._declare(
+            tensor,
+            tensor_id,
+            global_shape=global_shape,
+            partition=partition,
+            expert_id=expert_id,
+            layout_fingerprint=layout_fingerprint,
+        )
+
+    def _declare(
+        self,
+        tensor,
+        tensor_id,
+        *,
+        global_shape,
+        partition=WeightPartition(),
+        expert_id=None,
+        layout_fingerprint="sglang:row-major",
+    ):
+        """Declare already validated storage without repeating its lookup."""
         shape = tuple(global_shape) or (1,)
         if (
             not tensor_id
@@ -269,7 +372,11 @@ class WeightLayoutBuilder:
             )
 
     def local_buffer(self, name):
-        if name not in dict(self.model.named_buffers(remove_duplicate=False)):
+        try:
+            buffer = self.model.get_buffer(name)
+        except AttributeError:
+            buffer = None
+        if buffer is None:
             raise WeightManifestError(
                 f"local initialization must name a buffer: {name}"
             )
@@ -293,16 +400,19 @@ class WeightLayoutBuilder:
                 names[0],
             )
             for names in self._names.values()
-            if (tensor := self.tensors[names[0]]).numel()
+            if (tensor := self.tensors[names[0]]).numel() and not tensor.is_meta
         )
         for previous, current in zip(intervals, intervals[1:]):
             if current[0] < previous[1]:
                 raise WeightManifestError(
                     f"overlapping registered tensor storage: {previous[2]}, {current[2]}"
                 )
-        grouped = {}
+        grouped, signatures = {}, {}
         for region in (*self._views, *self._initializations):
-            grouped.setdefault(_storage_key(region.parameter), []).append(region)
+            identity = id(region.parameter)
+            if identity not in signatures:
+                signatures[identity] = _layout_storage_key(region.parameter)
+            grouped.setdefault(signatures[identity], []).append(region)
         for key, names in self._names.items():
             local = set(names) & self._local_buffers
             if local:
@@ -330,7 +440,7 @@ class WeightLayoutBuilder:
             frozenset(self._local_buffers),
             tuple(self._derived_state),
             {
-                n: _storage_key(t)
+                n: _layout_storage_key(t)
                 for n, t in self.tensors.items()
                 if n not in self._local_buffers
             },

@@ -6,8 +6,11 @@ from .layers import LayerLayoutBuilder
 
 
 class Qwen3WeightAdapter(WeightLayoutAdapter):
+    def _mlp(self, builder, module, name):
+        builder.mlp(module, name)
+
     def build_layout(self, model, context):
-        b = LayerLayoutBuilder(model)
+        b = LayerLayoutBuilder(model, allow_meta=context.allow_meta)
         if not isinstance(model.model.embed_tokens, PPMissingLayer):
             b.vocab_parallel(model.model.embed_tokens, "model.embed_tokens.weight")
         for index in range(model.start_layer, model.end_layer):
@@ -24,7 +27,7 @@ class Qwen3WeightAdapter(WeightLayoutAdapter):
                     getattr(attn, name).weight, f"{prefix}.self_attn.{name}.weight"
                 )
             b.rotary(attn.rotary_emb, prefix + ".self_attn.rotary_emb")
-            b.mlp(layer.mlp, prefix + ".mlp")
+            self._mlp(b, layer.mlp, prefix + ".mlp")
             for name in ("input_layernorm", "post_attention_layernorm"):
                 b.replicated(getattr(layer, name).weight, f"{prefix}.{name}.weight")
         if not isinstance(model.model.norm, PPMissingLayer):

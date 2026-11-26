@@ -234,7 +234,9 @@ def _participant_id(rank):
     return f"dp{rank.dp}:pp{rank.pp}:ep{rank.ep}:tp{rank.tp}"
 
 
-def _compile_group(index, tensor_ids, distribution, placement_set_id):
+def _compile_group(
+    index, tensor_ids, distribution, placement_set_id, participant_ids=None
+):
     """Construct final Mooncake descriptors, placement fragments and bindings once."""
     from mooncake.reshard.weight import (
         ParallelRank,
@@ -254,13 +256,20 @@ def _compile_group(index, tensor_ids, distribution, placement_set_id):
     for manifest in index.manifests:
         dp, tp, ep = distribution.ranks[index.global_tp(manifest.rank)]
         ranks.append(ParallelRank(dp=dp, tp=tp, ep=ep, pp=manifest.rank.pp))
+    identities = tuple(
+        _participant_id(rank)
+        if participant_ids is None
+        else participant_ids[m.worker_id]
+        for m, rank in zip(index.manifests, ranks)
+    )
     topology = ParallelTopology(
         dp_size=distribution.dp_size,
         tp_size=distribution.tp_size,
         ep_size=distribution.ep_size,
         pp_size=index.layout.pp_size,
         participants=tuple(
-            TopologyParticipant(_participant_id(rank), rank) for rank in ranks
+            TopologyParticipant(identity, rank)
+            for identity, rank in zip(identities, ranks)
         ),
     )
     descriptors, fragments = [], []
@@ -329,12 +338,12 @@ def _compile_group(index, tensor_ids, distribution, placement_set_id):
             placement_id=placement.placement_id,
             placement_digest=placement.digest,
             instance_id=manifest.instance_id,
-            participant_id=_participant_id(rank),
+            participant_id=identity,
             generation=manifest.generation,
             lease_id=f"immutable:{manifest.instance_id}",
             fragments=tuple(owned),
         )
-        for manifest, rank, owned in zip(index.manifests, ranks, runtime)
+        for manifest, identity, owned in zip(index.manifests, identities, runtime)
     )
     return placement, bindings
 
@@ -345,6 +354,7 @@ def build_mooncake_transfer_groups(
     *,
     source_parallel_layout,
     target_parallel_layout,
+    participant_ids=None,
 ):
     """Co-group tensors only when both sides have identical process mappings.
 
@@ -353,6 +363,20 @@ def build_mooncake_transfer_groups(
     """
     source = _ManifestIndex(source_runtime_manifests, source_parallel_layout)
     target = _ManifestIndex(target_runtime_manifests, target_parallel_layout)
+    if participant_ids is not None:
+        workers = {m.worker_id for m in source.manifests}
+        if (
+            workers != {m.worker_id for m in target.manifests}
+            or workers != set(participant_ids)
+            or len(workers) != len(source.manifests)
+            or len(set(participant_ids.values())) != len(workers)
+            or any(not identity for identity in participant_ids.values())
+            or tuple(m.worker_id for m in source.manifests)
+            != tuple(m.worker_id for m in target.manifests)
+        ):
+            raise WeightManifestError(
+                "stable participant identities require matching workers"
+            )
     if source.tensors.keys() != target.tensors.keys():
         raise WeightManifestError("source and target logical tensor inventories differ")
     groups = {}
@@ -366,10 +390,18 @@ def build_mooncake_transfer_groups(
         group_id = f"weights:{ordinal}"
         result[group_id] = (
             *_compile_group(
-                source, names, source_distribution, f"weight-cache-source:{group_id}"
+                source,
+                names,
+                source_distribution,
+                f"weight-cache-source:{group_id}",
+                participant_ids,
             ),
             *_compile_group(
-                target, names, target_distribution, f"weight-cache-target:{group_id}"
+                target,
+                names,
+                target_distribution,
+                f"weight-cache-target:{group_id}",
+                participant_ids,
             ),
         )
     return result

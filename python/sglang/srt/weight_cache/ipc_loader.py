@@ -382,29 +382,9 @@ class WeightCacheModelLoader(BaseModelLoader):
         Parameter without registering it as module state. Bind those references
         to the imported tensors; do not run weight transformations again.
         """
-        from dataclasses import fields, is_dataclass
+        from .tensor_aliases import capture_tensor_aliases
 
-        names = {id(tensor): name for name, tensor in registered.items()}
-        aliases, visited = [], set()
-
-        def visit(obj):
-            if id(obj) in visited:
-                return
-            visited.add(id(obj))
-            attributes = (
-                vars(obj).items()
-                if isinstance(obj, nn.Module)
-                else ((field.name, getattr(obj, field.name)) for field in fields(obj))
-            )
-            for key, value in attributes:
-                if isinstance(value, torch.Tensor) and id(value) in names:
-                    aliases.append((obj, key, names[id(value)], value))
-                elif not isinstance(value, type) and is_dataclass(value):
-                    visit(value)
-
-        for module in model.modules():
-            visit(module)
-        return aliases
+        return capture_tensor_aliases(model, registered)
 
     @staticmethod
     def _set_plain_module_value(model, name, value):
@@ -544,11 +524,9 @@ class WeightCacheModelLoader(BaseModelLoader):
                 + "\n".join(mismatched)
             )
 
-        for obj, key, name, previous in aliases:
-            if name in replacements and getattr(obj, key) is previous:
-                # Preserve explicit daemon-exported derived attributes and the
-                # original registration kind, including frozen dataclass fields.
-                object.__setattr__(obj, key, replacements[name])
+        from .tensor_aliases import rebind_tensor_aliases
+
+        rebind_tensor_aliases(aliases, replacements)
 
         # After mapping every daemon entry, any tensor still on the meta device
         # is one the daemon did NOT provide. Filling it with torch.empty() would

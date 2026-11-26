@@ -13,6 +13,18 @@ _PoolKey = Tuple[str, int, torch.dtype, torch.device]
 _forward_input_buffer_pool: Dict[_PoolKey, torch.Tensor] = {}
 
 
+def get_shared_input_buffer(name, shape, *, dtype, device) -> torch.Tensor:
+    """Reuse a contiguous pool view before allocating its zero-filled payload."""
+    layout = torch.empty(shape, dtype=dtype, device="meta")
+    # An empty probe resolves implicit device indices without allocating payload.
+    device = torch.empty(0, device=device).device
+    key: _PoolKey = (name, layout.numel(), dtype, device)
+    canonical = _forward_input_buffer_pool.get(key)
+    if canonical is not None:
+        return canonical.as_strided(layout.size(), layout.stride())
+    return share_input_buffer(name, torch.zeros(shape, dtype=dtype, device=device))
+
+
 def share_input_buffer(name: str, new_buffer: torch.Tensor) -> torch.Tensor:
     """Coalesce a buffer by ``(name, size, dtype, device)`` into the
     process-wide input-buffer pool.

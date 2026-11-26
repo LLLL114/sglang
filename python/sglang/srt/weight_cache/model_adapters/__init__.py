@@ -8,6 +8,7 @@ from .base import WeightAdapterContext, WeightLayoutAdapter
 
 _ADAPTERS = {
     "Qwen3ForCausalLM": ("qwen3", "Qwen3WeightAdapter"),
+    "Qwen3MoeForCausalLM": ("qwen3_moe", "Qwen3MoeWeightAdapter"),
     "DeepseekV2ForCausalLM": ("deepseek_v2", "DeepseekV2WeightAdapter"),
 }
 

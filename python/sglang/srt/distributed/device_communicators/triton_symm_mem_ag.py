@@ -544,6 +544,19 @@ class MultimemAllGatherer:
             tp_group = get_tp_group()
             if tp_group.world_size <= 1:
                 return None
+            if is_cuda():
+                from sglang.srt.distributed.device_communicators.multicast_all_gather import (
+                    has_multicast_support,
+                )
+
+                try:
+                    supported = has_multicast_support(x.device)
+                except Exception as e:
+                    logger.warning("multicast capability query failed (%s)", e)
+                    supported = False
+                # Every rank must vote even when its local driver query fails.
+                if not all(tp_group.all_gather_object(supported)):
+                    return None
             state = create_state(
                 group=tp_group.device_group,
                 rank_in_group=tp_group.rank_in_group,

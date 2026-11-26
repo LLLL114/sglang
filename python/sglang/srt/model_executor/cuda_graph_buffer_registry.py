@@ -34,7 +34,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.input_buffers import (
     INDEX_SEMANTIC_BUFFERS,
-    share_input_buffer,
+    get_shared_input_buffer,
 )
 from sglang.srt.runtime_context import get_parallel
 
@@ -387,12 +387,15 @@ class CudaGraphBufferRegistry:
             slot.buffer = bind
             self._slots[slot.name] = slot
             return slot
-        buffer = torch.zeros(shape, dtype=slot.dtype, device=device)
         if self.share_pool:
             # Coalesce with any same-named buffer (e.g. the legacy
             # DecodeInputBuffers field) so capture and replay see one
             # physical allocation with a stable data_ptr.
-            buffer = share_input_buffer(slot.name, buffer)
+            buffer = get_shared_input_buffer(
+                slot.name, shape, dtype=slot.dtype, device=device
+            )
+        else:
+            buffer = torch.zeros(shape, dtype=slot.dtype, device=device)
         if (
             slot.padding_policy
             in (PaddingPolicy.FILL_SENTINEL, PaddingPolicy.FILL_ONCE)

@@ -12,6 +12,7 @@ from ..weight_runtime_manifest import WeightManifestError
 @dataclass(frozen=True)
 class WeightAdapterContext:
     config: Any
+    allow_meta: bool = False
 
 
 class WeightLayoutAdapter(ABC):
@@ -19,7 +20,8 @@ class WeightLayoutAdapter(ABC):
         if getattr(model, "quant_config", None) is not None:
             raise WeightManifestError("model adapters support only unquantized weights")
         if torch.version.hip is not None or any(
-            p.device.type != "cuda" for p in model.parameters()
+            p.device.type != "cuda" and not (context.allow_meta and p.is_meta)
+            for p in model.parameters()
         ):
             raise WeightManifestError(
                 "model adapters currently support NVIDIA CUDA storage only"
